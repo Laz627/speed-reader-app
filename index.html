@@ -75,6 +75,37 @@
       background-position: right 4px center;
       padding-right: 20px;
     }
+    
+    /* Chapter splash animation */
+    @keyframes fadeInUp {
+      from {
+        opacity: 0;
+        transform: translateY(20px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+    
+    @keyframes fadeOut {
+      from { opacity: 1; }
+      to { opacity: 0; }
+    }
+    
+    .chapter-splash {
+      animation: fadeInUp 0.5s ease-out;
+    }
+    
+    .chapter-splash.fading {
+      animation: fadeOut 0.5s ease-out forwards;
+    }
+    
+    /* Dialogue indicator pulse */
+    @keyframes subtlePulse {
+      0%, 100% { opacity: 0.6; }
+      50% { opacity: 0.9; }
+    }
   </style>
 </head>
 <body>
@@ -89,6 +120,21 @@
   
   <script>
     // ============================================================
+    // CONSTANTS & SPECIAL MARKERS
+    // ============================================================
+    
+    // Special marker for paragraph breaks (pilcrow symbol)
+    const PARAGRAPH_MARKER = '\u00B6PARA\u00B6';
+    
+    // Punctuation patterns for stripping from display
+    const LEADING_PUNCT = /^["'"'«¿¡([{]+/;
+    const TRAILING_PUNCT = /[""''»)\]}.!?,;:—–-]+$/;
+    
+    // Quote characters for tracking dialogue state
+    const OPEN_QUOTES = ['"', "'", '"', ''', '«', '¿', '¡'];
+    const CLOSE_QUOTES = ['"', "'", '"', ''', '»'];
+    
+    // ============================================================
     // ORP (Optimal Recognition Point) Logic
     // ============================================================
     
@@ -97,6 +143,7 @@
     };
 
     function getORPIndex(word) {
+      // Strip punctuation for ORP calculation
       const letters = word.replace(/[^a-zA-Z]/g, '');
       const len = letters.length;
       if (len === 0) return 0;
@@ -115,6 +162,68 @@
         }
       }
       return 0;
+    }
+
+    // ============================================================
+    // Word Processing for Display
+    // Separates leading/trailing punctuation from core word
+    // ============================================================
+    
+    function processWordForDisplay(word) {
+      // Handle paragraph markers - not displayed
+      if (word === PARAGRAPH_MARKER) {
+        return { leadingPunct: '', coreWord: '', trailingPunct: '', isParagraphBreak: true };
+      }
+      
+      let leadingPunct = '';
+      let trailingPunct = '';
+      let coreWord = word;
+      
+      // Extract leading punctuation
+      const leadingMatch = coreWord.match(LEADING_PUNCT);
+      if (leadingMatch) {
+        leadingPunct = leadingMatch[0];
+        coreWord = coreWord.slice(leadingPunct.length);
+      }
+      
+      // Extract trailing punctuation
+      const trailingMatch = coreWord.match(TRAILING_PUNCT);
+      if (trailingMatch) {
+        trailingPunct = trailingMatch[0];
+        coreWord = coreWord.slice(0, -trailingPunct.length);
+      }
+      
+      // If everything got stripped, restore the original
+      if (!coreWord && word) {
+        coreWord = word;
+        leadingPunct = '';
+        trailingPunct = '';
+      }
+      
+      return { leadingPunct, coreWord, trailingPunct, isParagraphBreak: false };
+    }
+    
+    // ============================================================
+    // Dialogue State Tracking
+    // Tracks whether we're inside quotes across words
+    // ============================================================
+    
+    function updateDialogueState(word, currentlyInDialogue) {
+      let inDialogue = currentlyInDialogue;
+      
+      for (const char of word) {
+        if (OPEN_QUOTES.includes(char) && !inDialogue) {
+          inDialogue = true;
+        } else if (CLOSE_QUOTES.includes(char) && inDialogue) {
+          // Check if it's a closing quote (basic heuristic: after letters)
+          const idx = word.indexOf(char);
+          if (idx > 0 || currentlyInDialogue) {
+            inDialogue = false;
+          }
+        }
+      }
+      
+      return inDialogue;
     }
 
     // ============================================================
@@ -191,9 +300,15 @@
     function extractTextFromHTML(html) {
       let text = html.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '');
       text = text.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '');
-      text = text.replace(/<\/(p|div|h[1-6]|li|br|tr)>/gi, '\n');
+      
+      // Mark paragraph breaks with special handling
+      // Replace closing paragraph/div tags with double newlines
+      text = text.replace(/<\/(p|div)>/gi, '\n\n');
+      text = text.replace(/<\/(h[1-6]|li|tr)>/gi, '\n');
       text = text.replace(/<br[^>]*>/gi, '\n');
       text = text.replace(/<[^>]+>/g, ' ');
+      
+      // HTML entities
       text = text.replace(/&nbsp;/g, ' ');
       text = text.replace(/&amp;/g, '&');
       text = text.replace(/&lt;/g, '<');
@@ -205,9 +320,19 @@
       text = text.replace(/&ldquo;/g, '"');
       text = text.replace(/&mdash;/g, '—');
       text = text.replace(/&ndash;/g, '–');
+      text = text.replace(/&hellip;/g, '…');
       text = text.replace(/&#(\d+);/g, (_, code) => String.fromCharCode(code));
+      
+      // Normalize spaces
       text = text.replace(/[ \t]+/g, ' ');
-      text = text.replace(/\n\s*\n/g, '\n\n');
+      
+      // Preserve paragraph breaks by replacing double+ newlines with marker
+      // This happens BEFORE we split into words
+      text = text.replace(/\n\s*\n\s*/g, ` ${PARAGRAPH_MARKER} `);
+      
+      // Single newlines become spaces
+      text = text.replace(/\n/g, ' ');
+      
       return text.trim();
     }
 
@@ -244,12 +369,14 @@
     const { useState, useEffect, useCallback, useRef } = React;
 
     function SpeedReader() {
+      // Book state
       const [book, setBook] = useState(null);
       const [chapterIndex, setChapterIndex] = useState(0);
       const [isDragging, setIsDragging] = useState(false);
       const [loadError, setLoadError] = useState(null);
       const [isLoading, setIsLoading] = useState(false);
       
+      // Reading state
       const [words, setWords] = useState([]);
       const [sentences, setSentences] = useState([]);
       const [currentIndex, setCurrentIndex] = useState(0);
@@ -260,9 +387,18 @@
       const [showTextInput, setShowTextInput] = useState(false);
       const [inputText, setInputText] = useState('');
       
+      // NEW: Chapter splash state
+      const [showChapterSplash, setShowChapterSplash] = useState(false);
+      const [splashFading, setSplashFading] = useState(false);
+      const [pendingPlay, setPendingPlay] = useState(false);
+      
+      // NEW: Dialogue tracking state
+      const [inDialogue, setInDialogue] = useState(false);
+      
       const intervalRef = useRef(null);
       const fileInputRef = useRef(null);
       const saveIntervalRef = useRef(null);
+      const splashTimeoutRef = useRef(null);
 
       const demoText = `Welcome to Speed Reader. Drop an EPUB file anywhere on this screen to begin reading, or tap the Open button below.
 
@@ -272,20 +408,27 @@ Use the Play button to start reading at your chosen speed. The red letter marks 
 
 Your progress is automatically saved, so you can close the app and pick up right where you left off.
 
+"This is example dialogue," she said, "to demonstrate how quotes are now handled more smoothly."
+
 Adjust your reading speed with the WPM slider. Most people start around 300 words per minute and gradually increase with practice. Happy reading!`;
 
-      // Parse chapter text
+      // ============================================================
+      // Parse chapter text into words with paragraph markers
+      // ============================================================
       useEffect(() => {
         const text = book ? book.chapters[chapterIndex]?.text : demoText;
         if (!text) return;
         
+        // Split by whitespace, keeping paragraph markers as separate tokens
         const parsed = text.trim().split(/\s+/).filter(w => w.length > 0);
         setWords(parsed);
         
+        // Build sentence indices (excluding paragraph markers)
         const sentenceIndices = [];
         let sentenceStart = 0;
         
         parsed.forEach((word, idx) => {
+          if (word === PARAGRAPH_MARKER) return; // Skip markers for sentence calculation
           if (/[.!?]$/.test(word)) {
             sentenceIndices.push({ start: sentenceStart, end: idx });
             sentenceStart = idx + 1;
@@ -297,9 +440,14 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
         }
         
         setSentences(sentenceIndices);
+        
+        // Reset dialogue state for new chapter
+        setInDialogue(false);
       }, [book, chapterIndex]);
 
+      // ============================================================
       // Load saved progress
+      // ============================================================
       useEffect(() => {
         if (book) {
           const saved = loadProgress(book.title);
@@ -330,6 +478,49 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
         }
       }, [book, isPlaying, chapterIndex, currentIndex]);
 
+      // ============================================================
+      // Chapter splash screen logic
+      // Shows chapter title for 3 seconds when chapter changes
+      // ============================================================
+      const triggerChapterSplash = useCallback((chapterIdx, shouldAutoPlay = false) => {
+        // Clear any existing splash timeout
+        if (splashTimeoutRef.current) {
+          clearTimeout(splashTimeoutRef.current);
+        }
+        
+        setShowChapterSplash(true);
+        setSplashFading(false);
+        setPendingPlay(shouldAutoPlay);
+        
+        // Start fade out after 2.5 seconds
+        splashTimeoutRef.current = setTimeout(() => {
+          setSplashFading(true);
+          
+          // Hide completely after fade
+          setTimeout(() => {
+            setShowChapterSplash(false);
+            setSplashFading(false);
+            
+            // Auto-play if this was triggered by chapter advance
+            if (shouldAutoPlay) {
+              setIsPlaying(true);
+            }
+          }, 500);
+        }, 2500);
+      }, []);
+
+      // Cleanup splash timeout on unmount
+      useEffect(() => {
+        return () => {
+          if (splashTimeoutRef.current) {
+            clearTimeout(splashTimeoutRef.current);
+          }
+        };
+      }, []);
+
+      // ============================================================
+      // Sentence navigation helpers
+      // ============================================================
       const getCurrentSentence = useCallback(() => {
         for (let i = 0; i < sentences.length; i++) {
           if (currentIndex >= sentences[i].start && currentIndex <= sentences[i].end) {
@@ -339,31 +530,73 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
         return 0;
       }, [currentIndex, sentences]);
 
+      // ============================================================
+      // Delay calculation with extended punctuation rules
+      // ============================================================
       const getDelay = useCallback((word) => {
         const baseDelay = 60000 / wpm;
         if (!pausesEnabled) return baseDelay;
         
-        if (/[.!?]$/.test(word)) return baseDelay * 2.2;
-        if (/[,;:]$/.test(word)) return baseDelay * 1.4;
+        // Paragraph break = long pause (2.5 seconds)
+        if (word === PARAGRAPH_MARKER) {
+          return 2500;
+        }
         
-        const len = word.length;
+        // Em-dash (—) = 1.3x delay
+        if (word.includes('—')) {
+          return baseDelay * 1.3;
+        }
+        
+        // Ellipsis (...) = 1.8x delay
+        if (word.includes('...') || word.includes('…')) {
+          return baseDelay * 1.8;
+        }
+        
+        // Sentence-ending punctuation = 2.2x delay
+        if (/[.!?]["'"']?$/.test(word)) {
+          return baseDelay * 2.2;
+        }
+        
+        // Comma, semicolon, colon = 1.4x delay
+        if (/[,;:]$/.test(word)) {
+          return baseDelay * 1.4;
+        }
+        
+        // Opening quote at start of word = 1.2x delay (slight pause before dialogue)
+        if (LEADING_PUNCT.test(word) && /^["'"'«]/.test(word)) {
+          return baseDelay * 1.2;
+        }
+        
+        // Long words get slight delay
+        const len = word.replace(/[^a-zA-Z]/g, '').length;
         if (len > 10) return baseDelay * 1.15;
         if (len > 7) return baseDelay * 1.08;
         
         return baseDelay;
       }, [wpm, pausesEnabled]);
 
-      // Playback
+      // ============================================================
+      // Playback loop
+      // ============================================================
       useEffect(() => {
-        if (isPlaying && words.length > 0) {
+        if (isPlaying && words.length > 0 && !showChapterSplash) {
           const currentWord = words[currentIndex] || '';
           const delay = getDelay(currentWord);
           
           intervalRef.current = setTimeout(() => {
+            // Update dialogue state
+            if (currentWord !== PARAGRAPH_MARKER) {
+              setInDialogue(prev => updateDialogueState(currentWord, prev));
+            }
+            
             setCurrentIndex(prev => {
               if (prev >= words.length - 1) {
+                // End of chapter - advance to next if available
                 if (book && chapterIndex < book.chapters.length - 1) {
-                  setChapterIndex(ci => ci + 1);
+                  const nextChapter = chapterIndex + 1;
+                  setChapterIndex(nextChapter);
+                  setIsPlaying(false); // Pause for splash
+                  triggerChapterSplash(nextChapter, true); // Will auto-play after splash
                   return 0;
                 }
                 setIsPlaying(false);
@@ -377,18 +610,22 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
         return () => {
           if (intervalRef.current) clearTimeout(intervalRef.current);
         };
-      }, [isPlaying, currentIndex, words, getDelay, book, chapterIndex]);
+      }, [isPlaying, currentIndex, words, getDelay, book, chapterIndex, showChapterSplash, triggerChapterSplash]);
 
-      // Reset index when chapter changes
+      // Reset index when chapter changes (manual change)
       useEffect(() => {
         if (book) {
           const saved = loadProgress(book.title);
           if (!saved || saved.chapterIndex !== chapterIndex) {
             setCurrentIndex(0);
+            setInDialogue(false);
           }
         }
       }, [chapterIndex]);
 
+      // ============================================================
+      // Event handlers
+      // ============================================================
       const handleDragOver = (e) => {
         e.preventDefault();
         setIsDragging(true);
@@ -425,6 +662,10 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
           const parsed = await parseEPUB(file);
           setBook(parsed);
           setCurrentIndex(0);
+          setInDialogue(false);
+          
+          // Show chapter splash for first chapter
+          triggerChapterSplash(0, false);
         } catch (err) {
           console.error('EPUB parse error:', err);
           setLoadError(err.message || 'Failed to parse EPUB');
@@ -434,8 +675,12 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
       };
 
       const handlePlayPause = () => {
+        // Don't allow play during splash
+        if (showChapterSplash) return;
+        
         if (currentIndex >= words.length - 1 && !isPlaying) {
           setCurrentIndex(0);
+          setInDialogue(false);
         }
         setIsPlaying(!isPlaying);
       };
@@ -443,6 +688,7 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
       const handleReset = () => {
         setIsPlaying(false);
         setCurrentIndex(0);
+        setInDialogue(false);
       };
 
       const handleBackSentence = () => {
@@ -454,6 +700,9 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
         } else if (currentSentenceIdx > 0) {
           setCurrentIndex(sentences[currentSentenceIdx - 1].start);
         }
+        
+        // Reset dialogue state when navigating (simplified approach)
+        setInDialogue(false);
       };
 
       const handleForwardSentence = () => {
@@ -468,6 +717,8 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
         setIsPlaying(false);
         setChapterIndex(newIndex);
         setCurrentIndex(0);
+        setInDialogue(false);
+        triggerChapterSplash(newIndex, false);
       };
 
       const handleSetText = () => {
@@ -478,6 +729,7 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
           });
           setChapterIndex(0);
           setCurrentIndex(0);
+          setInDialogue(false);
           setShowTextInput(false);
           setInputText('');
         } else {
@@ -491,37 +743,193 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
         setChapterIndex(0);
         setCurrentIndex(0);
         setIsPlaying(false);
+        setInDialogue(false);
+        setShowChapterSplash(false);
       };
 
+      // ============================================================
+      // Word rendering with punctuation separation
+      // ============================================================
       const renderWord = () => {
         const word = words[currentIndex] || '';
         if (!word) return React.createElement('span', { style: { opacity: 0.3 } }, '—');
-
-        const orpPos = getORPPositionInWord(word);
-
+        
+        // Handle paragraph markers - show a subtle indicator
+        if (word === PARAGRAPH_MARKER) {
+          return React.createElement('span', {
+            style: {
+              opacity: 0.2,
+              fontSize: 'clamp(1.5rem, 8vw, 3rem)',
+            }
+          }, '¶');
+        }
+        
+        // Process word to separate punctuation
+        const { leadingPunct, coreWord, trailingPunct } = processWordForDisplay(word);
+        
+        // Calculate ORP position on the CORE word only
+        const orpPos = getORPPositionInWord(coreWord);
+        
+        // Style for dimmed punctuation
+        const punctStyle = {
+          color: darkMode ? 'rgba(255,255,255,0.35)' : 'rgba(0,0,0,0.35)',
+          fontWeight: '300',
+        };
+        
         return React.createElement('span', {
           style: {
             fontFamily: "'Montserrat', sans-serif",
             fontSize: 'clamp(2.5rem, 12vw, 4.5rem)',
             fontWeight: '400',
             letterSpacing: '0.02em',
+            display: 'flex',
+            alignItems: 'baseline',
+            justifyContent: 'center',
           }
-        }, word.split('').map((char, idx) => 
-          React.createElement('span', {
-            key: idx,
-            style: {
-              color: idx === orpPos ? '#ef4444' : (darkMode ? '#ffffff' : '#1a1a1a'),
-              fontWeight: idx === orpPos ? '500' : '400',
-            }
-          }, char)
-        ));
+        }, [
+          // Leading punctuation (dimmed, slightly smaller)
+          leadingPunct && React.createElement('span', {
+            key: 'leading',
+            style: { ...punctStyle, fontSize: '0.75em', marginRight: '0.05em' }
+          }, leadingPunct),
+          
+          // Core word with ORP highlighting
+          React.createElement('span', { key: 'core' }, 
+            coreWord.split('').map((char, idx) => 
+              React.createElement('span', {
+                key: idx,
+                style: {
+                  color: idx === orpPos ? '#ef4444' : (darkMode ? '#ffffff' : '#1a1a1a'),
+                  fontWeight: idx === orpPos ? '500' : '400',
+                }
+              }, char)
+            )
+          ),
+          
+          // Trailing punctuation (dimmed, slightly smaller)
+          trailingPunct && React.createElement('span', {
+            key: 'trailing',
+            style: { ...punctStyle, fontSize: '0.85em', marginLeft: '0.02em' }
+          }, trailingPunct),
+        ]);
       };
 
-      const progress = words.length > 0 ? ((currentIndex + 1) / words.length) * 100 : 0;
-      const wordsRemaining = words.length - currentIndex - 1;
+      // ============================================================
+      // Chapter splash screen component
+      // ============================================================
+      const renderChapterSplash = () => {
+        if (!showChapterSplash || !book) return null;
+        
+        const chapter = book.chapters[chapterIndex];
+        if (!chapter) return null;
+        
+        return React.createElement('div', {
+          key: 'splash',
+          className: `chapter-splash ${splashFading ? 'fading' : ''}`,
+          style: {
+            position: 'fixed',
+            inset: 0,
+            zIndex: 100,
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            justifyContent: 'center',
+            backgroundColor: darkMode ? 'rgba(10, 10, 10, 0.95)' : 'rgba(250, 250, 250, 0.95)',
+            backdropFilter: 'blur(8px)',
+          }
+        }, [
+          // Chapter number
+          React.createElement('div', {
+            key: 'number',
+            style: {
+              fontSize: '0.875rem',
+              fontWeight: '500',
+              textTransform: 'uppercase',
+              letterSpacing: '0.15em',
+              color: '#ef4444',
+              marginBottom: '1rem',
+            }
+          }, `Chapter ${chapterIndex + 1} of ${book.chapters.length}`),
+          
+          // Chapter title
+          React.createElement('div', {
+            key: 'title',
+            style: {
+              fontSize: 'clamp(1.5rem, 6vw, 2.5rem)',
+              fontWeight: '600',
+              textAlign: 'center',
+              padding: '0 2rem',
+              color: darkMode ? '#ffffff' : '#1a1a1a',
+              maxWidth: '600px',
+              lineHeight: '1.3',
+            }
+          }, chapter.title),
+          
+          // Subtitle
+          React.createElement('div', {
+            key: 'subtitle',
+            style: {
+              marginTop: '1.5rem',
+              fontSize: '0.875rem',
+              color: darkMode ? 'rgba(255,255,255,0.5)' : 'rgba(0,0,0,0.5)',
+            }
+          }, pendingPlay ? 'Starting in a moment...' : 'Tap Play to begin'),
+        ]);
+      };
+
+      // ============================================================
+      // Dialogue indicator component
+      // ============================================================
+      const renderDialogueIndicator = () => {
+        if (!inDialogue || showChapterSplash) return null;
+        
+        return React.createElement('div', {
+          key: 'dialogue-indicator',
+          style: {
+            position: 'absolute',
+            top: '1rem',
+            left: '50%',
+            transform: 'translateX(-50%)',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.5rem',
+            padding: '0.375rem 0.75rem',
+            borderRadius: '999px',
+            backgroundColor: darkMode ? 'rgba(239, 68, 68, 0.15)' : 'rgba(239, 68, 68, 0.1)',
+            border: `1px solid ${darkMode ? 'rgba(239, 68, 68, 0.3)' : 'rgba(239, 68, 68, 0.2)'}`,
+            animation: 'subtlePulse 3s ease-in-out infinite',
+          }
+        }, [
+          React.createElement('span', {
+            key: 'icon',
+            style: { fontSize: '0.875rem', opacity: 0.8 }
+          }, '"'),
+          React.createElement('span', {
+            key: 'text',
+            style: {
+              fontSize: '0.6875rem',
+              fontWeight: '500',
+              textTransform: 'uppercase',
+              letterSpacing: '0.05em',
+              color: darkMode ? 'rgba(239, 68, 68, 0.9)' : 'rgba(239, 68, 68, 0.8)',
+            }
+          }, 'Dialogue'),
+        ]);
+      };
+
+      // ============================================================
+      // Calculate progress stats (excluding paragraph markers)
+      // ============================================================
+      const actualWords = words.filter(w => w !== PARAGRAPH_MARKER);
+      const actualCurrentIndex = words.slice(0, currentIndex + 1).filter(w => w !== PARAGRAPH_MARKER).length - 1;
+      const progress = actualWords.length > 0 ? ((Math.max(0, actualCurrentIndex) + 1) / actualWords.length) * 100 : 0;
+      const wordsRemaining = actualWords.length - actualCurrentIndex - 1;
       const timeRemaining = wordsRemaining > 0 ? Math.ceil(wordsRemaining / wpm) : 0;
       const currentSentenceNum = getCurrentSentence() + 1;
 
+      // ============================================================
+      // Theme configuration
+      // ============================================================
       const theme = {
         bg: darkMode ? '#0a0a0a' : '#fafafa',
         card: darkMode ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.03)',
@@ -547,7 +955,9 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
         transition: 'all 0.15s ease',
       };
 
+      // ============================================================
       // Main render
+      // ============================================================
       return React.createElement('div', {
         style: {
           minHeight: '100vh',
@@ -561,6 +971,9 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
         onDragLeave: handleDragLeave,
         onDrop: handleDrop,
       }, [
+        // Chapter splash overlay
+        renderChapterSplash(),
+        
         // Drop overlay
         isDragging && React.createElement('div', {
           key: 'drop',
@@ -662,7 +1075,7 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
           })),
         ]),
 
-        // Word display
+        // Word display area
         React.createElement('div', {
           key: 'display',
           style: {
@@ -672,40 +1085,46 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
             justifyContent: 'center',
             padding: '1rem',
             minHeight: '220px',
+            position: 'relative',
           }
-        }, showTextInput
-          ? React.createElement('div', { style: { width: '100%', maxWidth: '32rem' } },
-              React.createElement('textarea', {
-                value: inputText,
-                onChange: (e) => setInputText(e.target.value),
-                autoFocus: true,
-                placeholder: 'Paste your text here...',
-                style: {
-                  width: '100%',
-                  height: '14rem',
-                  padding: '1rem',
-                  borderRadius: '0.75rem',
-                  fontSize: '0.9375rem',
-                  lineHeight: '1.6',
-                  resize: 'none',
-                  backgroundColor: theme.card,
-                  color: theme.text,
-                  border: `1px solid ${theme.cardBorder}`,
-                  outline: 'none',
-                }
-              })
-            )
-          : loadError
-            ? React.createElement('div', { style: { textAlign: 'center', padding: '1.5rem' } }, [
-                React.createElement('div', { key: 'err', style: { color: '#f87171', marginBottom: '0.5rem' } }, `⚠️ ${loadError}`),
-                React.createElement('button', {
-                  key: 'dismiss',
-                  onClick: () => setLoadError(null),
-                  style: { fontSize: '0.875rem', textDecoration: 'underline', color: theme.muted, background: 'none', border: 'none', cursor: 'pointer' }
-                }, 'Dismiss'),
-              ])
-            : renderWord()
-        ),
+        }, [
+          // Dialogue indicator
+          renderDialogueIndicator(),
+          
+          // Main content
+          showTextInput
+            ? React.createElement('div', { key: 'input', style: { width: '100%', maxWidth: '32rem' } },
+                React.createElement('textarea', {
+                  value: inputText,
+                  onChange: (e) => setInputText(e.target.value),
+                  autoFocus: true,
+                  placeholder: 'Paste your text here...',
+                  style: {
+                    width: '100%',
+                    height: '14rem',
+                    padding: '1rem',
+                    borderRadius: '0.75rem',
+                    fontSize: '0.9375rem',
+                    lineHeight: '1.6',
+                    resize: 'none',
+                    backgroundColor: theme.card,
+                    color: theme.text,
+                    border: `1px solid ${theme.cardBorder}`,
+                    outline: 'none',
+                  }
+                })
+              )
+            : loadError
+              ? React.createElement('div', { key: 'error', style: { textAlign: 'center', padding: '1.5rem' } }, [
+                  React.createElement('div', { key: 'err', style: { color: '#f87171', marginBottom: '0.5rem' } }, `⚠️ ${loadError}`),
+                  React.createElement('button', {
+                    key: 'dismiss',
+                    onClick: () => setLoadError(null),
+                    style: { fontSize: '0.875rem', textDecoration: 'underline', color: theme.muted, background: 'none', border: 'none', cursor: 'pointer' }
+                  }, 'Dismiss'),
+                ])
+              : React.createElement('div', { key: 'word' }, renderWord())
+        ]),
 
         // Controls
         React.createElement('div', {
@@ -729,6 +1148,7 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
             React.createElement('button', {
               key: 'play',
               onClick: handlePlayPause,
+              disabled: showChapterSplash,
               style: {
                 ...buttonStyle,
                 backgroundColor: isPlaying ? 'transparent' : theme.accent,
@@ -736,6 +1156,7 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
                 border: isPlaying ? `2px solid ${theme.accent}` : 'none',
                 padding: '12px 28px',
                 fontWeight: '600',
+                opacity: showChapterSplash ? 0.5 : 1,
               }
             }, isPlaying ? 'Pause' : 'Play'),
             React.createElement('button', { key: 'reset', onClick: handleReset, style: buttonStyle }, 'Reset'),
