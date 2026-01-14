@@ -1,0 +1,827 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#0a0a0a">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="description" content="RSVP Speed Reader for EPUB books">
+  
+  <title>Speed Reader</title>
+  
+  <link rel="manifest" href="manifest.json">
+  <link rel="apple-touch-icon" href="icon-192.png">
+  
+  <!-- Preload fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Montserrat:wght@400;500&display=swap" rel="stylesheet">
+  
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+      -webkit-tap-highlight-color: transparent;
+    }
+    
+    html, body, #root {
+      height: 100%;
+      overflow: hidden;
+    }
+    
+    body {
+      font-family: 'Inter', system-ui, sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+    
+    /* Range input styling */
+    input[type="range"] {
+      -webkit-appearance: none;
+      appearance: none;
+      background: transparent;
+    }
+    
+    input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      background: #ef4444;
+      cursor: pointer;
+      margin-top: -7px;
+    }
+    
+    input[type="range"]::-webkit-slider-runnable-track {
+      height: 4px;
+      border-radius: 2px;
+    }
+    
+    /* Hide scrollbar but allow scroll */
+    .hide-scrollbar {
+      -ms-overflow-style: none;
+      scrollbar-width: none;
+    }
+    .hide-scrollbar::-webkit-scrollbar {
+      display: none;
+    }
+    
+    /* Select styling */
+    select {
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23888' d='M6 8L2 4h8z'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 4px center;
+      padding-right: 20px;
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  
+  <!-- React -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  
+  <!-- JSZip for EPUB parsing -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  
+  <script>
+    // ============================================================
+    // ORP (Optimal Recognition Point) Logic
+    // ============================================================
+    
+    const ORP_TABLE = {
+      1: 0, 2: 0, 3: 1, 4: 1, 5: 1, 6: 2, 7: 2, 8: 2, 9: 3, 10: 3, 11: 3, 12: 4, 13: 4,
+    };
+
+    function getORPIndex(word) {
+      const letters = word.replace(/[^a-zA-Z]/g, '');
+      const len = letters.length;
+      if (len === 0) return 0;
+      if (len <= 13) return ORP_TABLE[len];
+      return Math.floor(len * 0.3);
+    }
+
+    function getORPPositionInWord(word) {
+      const orpIndex = getORPIndex(word);
+      let letterCount = 0;
+      
+      for (let i = 0; i < word.length; i++) {
+        if (/[a-zA-Z]/.test(word[i])) {
+          if (letterCount === orpIndex) return i;
+          letterCount++;
+        }
+      }
+      return 0;
+    }
+
+    // ============================================================
+    // EPUB Parser
+    // ============================================================
+
+    async function parseEPUB(file) {
+      const zip = await JSZip.loadAsync(file);
+      
+      const containerXml = await zip.file('META-INF/container.xml')?.async('string');
+      if (!containerXml) throw new Error('Invalid EPUB: missing container.xml');
+      
+      const opfPathMatch = containerXml.match(/full-path="([^"]+)"/);
+      if (!opfPathMatch) throw new Error('Invalid EPUB: cannot find OPF path');
+      
+      const opfPath = opfPathMatch[1];
+      const opfDir = opfPath.substring(0, opfPath.lastIndexOf('/') + 1);
+      
+      const opfContent = await zip.file(opfPath)?.async('string');
+      if (!opfContent) throw new Error('Invalid EPUB: missing OPF file');
+      
+      const titleMatch = opfContent.match(/<dc:title[^>]*>([^<]+)<\/dc:title>/i);
+      const title = titleMatch ? titleMatch[1].trim() : file.name.replace('.epub', '');
+      
+      const spineMatches = [...opfContent.matchAll(/<itemref[^>]+idref="([^"]+)"[^>]*>/g)];
+      const spineIds = spineMatches.map(m => m[1]);
+      
+      const manifestItems = {};
+      const itemMatches = [...opfContent.matchAll(/<item[^>]+id="([^"]+)"[^>]+href="([^"]+)"[^>]*>/g)];
+      itemMatches.forEach(m => { manifestItems[m[1]] = m[2]; });
+      
+      const itemMatches2 = [...opfContent.matchAll(/<item[^>]+href="([^"]+)"[^>]+id="([^"]+)"[^>]*>/g)];
+      itemMatches2.forEach(m => { manifestItems[m[2]] = m[1]; });
+      
+      const chapters = [];
+      
+      for (const spineId of spineIds) {
+        const href = manifestItems[spineId];
+        if (!href) continue;
+        
+        // Handle URL-encoded paths
+        const decodedHref = decodeURIComponent(href);
+        const fullPath = opfDir + decodedHref;
+        
+        let content = await zip.file(fullPath)?.async('string');
+        if (!content) {
+          // Try without decoding
+          content = await zip.file(opfDir + href)?.async('string');
+        }
+        if (!content) continue;
+        
+        const text = extractTextFromHTML(content);
+        if (text.trim().length < 50) continue;
+        
+        const h1Match = content.match(/<h1[^>]*>([^<]+)<\/h1>/i);
+        const h2Match = content.match(/<h2[^>]*>([^<]+)<\/h2>/i);
+        const titleTagMatch = content.match(/<title[^>]*>([^<]+)<\/title>/i);
+        const chapterTitle = h1Match?.[1]?.trim() || h2Match?.[1]?.trim() || titleTagMatch?.[1]?.trim() || `Chapter ${chapters.length + 1}`;
+        
+        chapters.push({
+          id: spineId,
+          title: chapterTitle.substring(0, 50),
+          text: text.trim(),
+        });
+      }
+      
+      if (chapters.length === 0) {
+        throw new Error('Could not extract any chapters from EPUB');
+      }
+      
+      return { title, chapters };
+    }
+
+    function extractTextFromHTML(html) {
+      let text = html.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '');
+      text = text.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '');
+      text = text.replace(/<\/(p|div|h[1-6]|li|br|tr)>/gi, '\n');
+      text = text.replace(/<br[^>]*>/gi, '\n');
+      text = text.replace(/<[^>]+>/g, ' ');
+      text = text.replace(/&nbsp;/g, ' ');
+      text = text.replace(/&amp;/g, '&');
+      text = text.replace(/&lt;/g, '<');
+      text = text.replace(/&gt;/g, '>');
+      text = text.replace(/&quot;/g, '"');
+      text = text.replace(/&rsquo;/g, "'");
+      text = text.replace(/&lsquo;/g, "'");
+      text = text.replace(/&rdquo;/g, '"');
+      text = text.replace(/&ldquo;/g, '"');
+      text = text.replace(/&mdash;/g, '—');
+      text = text.replace(/&ndash;/g, '–');
+      text = text.replace(/&#(\d+);/g, (_, code) => String.fromCharCode(code));
+      text = text.replace(/[ \t]+/g, ' ');
+      text = text.replace(/\n\s*\n/g, '\n\n');
+      return text.trim();
+    }
+
+    // ============================================================
+    // Progress Storage
+    // ============================================================
+
+    function getStorageKey(bookTitle) {
+      return `speedreader_${bookTitle.replace(/[^a-zA-Z0-9]/g, '_')}`;
+    }
+
+    function saveProgress(bookTitle, chapterIndex, wordIndex) {
+      try {
+        localStorage.setItem(getStorageKey(bookTitle), JSON.stringify({
+          chapterIndex,
+          wordIndex,
+          timestamp: Date.now(),
+        }));
+      } catch (e) {}
+    }
+
+    function loadProgress(bookTitle) {
+      try {
+        const data = localStorage.getItem(getStorageKey(bookTitle));
+        if (data) return JSON.parse(data);
+      } catch (e) {}
+      return null;
+    }
+
+    // ============================================================
+    // Main Component
+    // ============================================================
+
+    const { useState, useEffect, useCallback, useRef } = React;
+
+    function SpeedReader() {
+      const [book, setBook] = useState(null);
+      const [chapterIndex, setChapterIndex] = useState(0);
+      const [isDragging, setIsDragging] = useState(false);
+      const [loadError, setLoadError] = useState(null);
+      const [isLoading, setIsLoading] = useState(false);
+      
+      const [words, setWords] = useState([]);
+      const [sentences, setSentences] = useState([]);
+      const [currentIndex, setCurrentIndex] = useState(0);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const [wpm, setWpm] = useState(300);
+      const [darkMode, setDarkMode] = useState(true);
+      const [pausesEnabled, setPausesEnabled] = useState(true);
+      const [showTextInput, setShowTextInput] = useState(false);
+      const [inputText, setInputText] = useState('');
+      
+      const intervalRef = useRef(null);
+      const fileInputRef = useRef(null);
+      const saveIntervalRef = useRef(null);
+
+      const demoText = `Welcome to Speed Reader. Drop an EPUB file anywhere on this screen to begin reading, or tap the Open button below.
+
+The app will parse your book into chapters and let you navigate between them using the dropdown menu.
+
+Use the Play button to start reading at your chosen speed. The red letter marks the optimal recognition point for each word, helping your brain process text more efficiently.
+
+Your progress is automatically saved, so you can close the app and pick up right where you left off.
+
+Adjust your reading speed with the WPM slider. Most people start around 300 words per minute and gradually increase with practice. Happy reading!`;
+
+      // Parse chapter text
+      useEffect(() => {
+        const text = book ? book.chapters[chapterIndex]?.text : demoText;
+        if (!text) return;
+        
+        const parsed = text.trim().split(/\s+/).filter(w => w.length > 0);
+        setWords(parsed);
+        
+        const sentenceIndices = [];
+        let sentenceStart = 0;
+        
+        parsed.forEach((word, idx) => {
+          if (/[.!?]$/.test(word)) {
+            sentenceIndices.push({ start: sentenceStart, end: idx });
+            sentenceStart = idx + 1;
+          }
+        });
+        
+        if (sentenceStart < parsed.length) {
+          sentenceIndices.push({ start: sentenceStart, end: parsed.length - 1 });
+        }
+        
+        setSentences(sentenceIndices);
+      }, [book, chapterIndex]);
+
+      // Load saved progress
+      useEffect(() => {
+        if (book) {
+          const saved = loadProgress(book.title);
+          if (saved) {
+            setChapterIndex(saved.chapterIndex);
+            setCurrentIndex(saved.wordIndex);
+          } else {
+            setChapterIndex(0);
+            setCurrentIndex(0);
+          }
+        }
+      }, [book?.title]);
+
+      // Save progress while playing
+      useEffect(() => {
+        if (book && isPlaying) {
+          saveIntervalRef.current = setInterval(() => {
+            saveProgress(book.title, chapterIndex, currentIndex);
+          }, 5000);
+          return () => clearInterval(saveIntervalRef.current);
+        }
+      }, [book, isPlaying, chapterIndex, currentIndex]);
+
+      // Save on pause
+      useEffect(() => {
+        if (book && !isPlaying) {
+          saveProgress(book.title, chapterIndex, currentIndex);
+        }
+      }, [book, isPlaying, chapterIndex, currentIndex]);
+
+      const getCurrentSentence = useCallback(() => {
+        for (let i = 0; i < sentences.length; i++) {
+          if (currentIndex >= sentences[i].start && currentIndex <= sentences[i].end) {
+            return i;
+          }
+        }
+        return 0;
+      }, [currentIndex, sentences]);
+
+      const getDelay = useCallback((word) => {
+        const baseDelay = 60000 / wpm;
+        if (!pausesEnabled) return baseDelay;
+        
+        if (/[.!?]$/.test(word)) return baseDelay * 2.2;
+        if (/[,;:]$/.test(word)) return baseDelay * 1.4;
+        
+        const len = word.length;
+        if (len > 10) return baseDelay * 1.15;
+        if (len > 7) return baseDelay * 1.08;
+        
+        return baseDelay;
+      }, [wpm, pausesEnabled]);
+
+      // Playback
+      useEffect(() => {
+        if (isPlaying && words.length > 0) {
+          const currentWord = words[currentIndex] || '';
+          const delay = getDelay(currentWord);
+          
+          intervalRef.current = setTimeout(() => {
+            setCurrentIndex(prev => {
+              if (prev >= words.length - 1) {
+                if (book && chapterIndex < book.chapters.length - 1) {
+                  setChapterIndex(ci => ci + 1);
+                  return 0;
+                }
+                setIsPlaying(false);
+                return prev;
+              }
+              return prev + 1;
+            });
+          }, delay);
+        }
+        
+        return () => {
+          if (intervalRef.current) clearTimeout(intervalRef.current);
+        };
+      }, [isPlaying, currentIndex, words, getDelay, book, chapterIndex]);
+
+      // Reset index when chapter changes
+      useEffect(() => {
+        if (book) {
+          const saved = loadProgress(book.title);
+          if (!saved || saved.chapterIndex !== chapterIndex) {
+            setCurrentIndex(0);
+          }
+        }
+      }, [chapterIndex]);
+
+      const handleDragOver = (e) => {
+        e.preventDefault();
+        setIsDragging(true);
+      };
+
+      const handleDragLeave = (e) => {
+        e.preventDefault();
+        setIsDragging(false);
+      };
+
+      const handleDrop = async (e) => {
+        e.preventDefault();
+        setIsDragging(false);
+        const file = e.dataTransfer.files[0];
+        if (file) await loadFile(file);
+      };
+
+      const handleFileSelect = async (e) => {
+        const file = e.target.files?.[0];
+        if (file) await loadFile(file);
+      };
+
+      const loadFile = async (file) => {
+        if (!file.name.toLowerCase().endsWith('.epub')) {
+          setLoadError('Please select an EPUB file');
+          return;
+        }
+        
+        setIsLoading(true);
+        setLoadError(null);
+        setIsPlaying(false);
+        
+        try {
+          const parsed = await parseEPUB(file);
+          setBook(parsed);
+          setCurrentIndex(0);
+        } catch (err) {
+          console.error('EPUB parse error:', err);
+          setLoadError(err.message || 'Failed to parse EPUB');
+        } finally {
+          setIsLoading(false);
+        }
+      };
+
+      const handlePlayPause = () => {
+        if (currentIndex >= words.length - 1 && !isPlaying) {
+          setCurrentIndex(0);
+        }
+        setIsPlaying(!isPlaying);
+      };
+
+      const handleReset = () => {
+        setIsPlaying(false);
+        setCurrentIndex(0);
+      };
+
+      const handleBackSentence = () => {
+        const currentSentenceIdx = getCurrentSentence();
+        const currentSentence = sentences[currentSentenceIdx];
+        
+        if (currentIndex > currentSentence?.start) {
+          setCurrentIndex(currentSentence.start);
+        } else if (currentSentenceIdx > 0) {
+          setCurrentIndex(sentences[currentSentenceIdx - 1].start);
+        }
+      };
+
+      const handleForwardSentence = () => {
+        const currentSentenceIdx = getCurrentSentence();
+        
+        if (currentSentenceIdx < sentences.length - 1) {
+          setCurrentIndex(sentences[currentSentenceIdx + 1].start);
+        }
+      };
+
+      const handleChapterChange = (newIndex) => {
+        setIsPlaying(false);
+        setChapterIndex(newIndex);
+        setCurrentIndex(0);
+      };
+
+      const handleSetText = () => {
+        if (showTextInput && inputText.trim()) {
+          setBook({
+            title: 'Pasted Text',
+            chapters: [{ id: 'manual', title: 'Text', text: inputText.trim() }],
+          });
+          setChapterIndex(0);
+          setCurrentIndex(0);
+          setShowTextInput(false);
+          setInputText('');
+        } else {
+          setShowTextInput(!showTextInput);
+          setInputText(book?.chapters[chapterIndex]?.text || demoText);
+        }
+      };
+
+      const handleCloseBook = () => {
+        setBook(null);
+        setChapterIndex(0);
+        setCurrentIndex(0);
+        setIsPlaying(false);
+      };
+
+      const renderWord = () => {
+        const word = words[currentIndex] || '';
+        if (!word) return React.createElement('span', { style: { opacity: 0.3 } }, '—');
+
+        const orpPos = getORPPositionInWord(word);
+
+        return React.createElement('span', {
+          style: {
+            fontFamily: "'Montserrat', sans-serif",
+            fontSize: 'clamp(2.5rem, 12vw, 4.5rem)',
+            fontWeight: '400',
+            letterSpacing: '0.02em',
+          }
+        }, word.split('').map((char, idx) => 
+          React.createElement('span', {
+            key: idx,
+            style: {
+              color: idx === orpPos ? '#ef4444' : (darkMode ? '#ffffff' : '#1a1a1a'),
+              fontWeight: idx === orpPos ? '500' : '400',
+            }
+          }, char)
+        ));
+      };
+
+      const progress = words.length > 0 ? ((currentIndex + 1) / words.length) * 100 : 0;
+      const wordsRemaining = words.length - currentIndex - 1;
+      const timeRemaining = wordsRemaining > 0 ? Math.ceil(wordsRemaining / wpm) : 0;
+      const currentSentenceNum = getCurrentSentence() + 1;
+
+      const theme = {
+        bg: darkMode ? '#0a0a0a' : '#fafafa',
+        card: darkMode ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.03)',
+        cardBorder: darkMode ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.08)',
+        text: darkMode ? '#ffffff' : '#1a1a1a',
+        muted: darkMode ? 'rgba(255,255,255,0.45)' : 'rgba(0,0,0,0.45)',
+        accent: '#ef4444',
+        button: darkMode ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)',
+        buttonBorder: darkMode ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.12)',
+        dropZone: darkMode ? 'rgba(239,68,68,0.1)' : 'rgba(239,68,68,0.08)',
+      };
+
+      const buttonStyle = {
+        backgroundColor: theme.button,
+        color: theme.text,
+        border: `1px solid ${theme.buttonBorder}`,
+        borderRadius: '10px',
+        padding: '12px 20px',
+        fontSize: '14px',
+        fontWeight: '500',
+        fontFamily: "'Inter', system-ui, sans-serif",
+        cursor: 'pointer',
+        transition: 'all 0.15s ease',
+      };
+
+      // Main render
+      return React.createElement('div', {
+        style: {
+          minHeight: '100vh',
+          display: 'flex',
+          flexDirection: 'column',
+          backgroundColor: theme.bg,
+          color: theme.text,
+          fontFamily: "'Inter', system-ui, sans-serif",
+        },
+        onDragOver: handleDragOver,
+        onDragLeave: handleDragLeave,
+        onDrop: handleDrop,
+      }, [
+        // Drop overlay
+        isDragging && React.createElement('div', {
+          key: 'drop',
+          style: {
+            position: 'fixed',
+            inset: 0,
+            zIndex: 50,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            backgroundColor: theme.dropZone,
+            backdropFilter: 'blur(4px)',
+          }
+        }, React.createElement('div', { style: { textAlign: 'center' } }, [
+          React.createElement('div', { key: 'icon', style: { fontSize: '4rem', marginBottom: '1rem' } }, '📖'),
+          React.createElement('div', { key: 'text', style: { fontSize: '1.25rem', fontWeight: '500' } }, 'Drop EPUB to load'),
+        ])),
+
+        // Loading overlay
+        isLoading && React.createElement('div', {
+          key: 'loading',
+          style: {
+            position: 'fixed',
+            inset: 0,
+            zIndex: 50,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            backgroundColor: 'rgba(0,0,0,0.85)',
+          }
+        }, React.createElement('div', { style: { textAlign: 'center' } }, [
+          React.createElement('div', { key: 'title', style: { fontSize: '1.5rem', marginBottom: '0.5rem' } }, 'Loading...'),
+          React.createElement('div', { key: 'sub', style: { color: theme.muted } }, 'Parsing EPUB'),
+        ])),
+
+        // Header
+        React.createElement('div', {
+          key: 'header',
+          style: { padding: '1rem 1.25rem 0.75rem' }
+        }, [
+          // Book info
+          book && React.createElement('div', {
+            key: 'bookinfo',
+            style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem' }
+          }, [
+            React.createElement('div', { key: 'left', style: { flex: 1, minWidth: 0, marginRight: '0.75rem' } }, [
+              React.createElement('div', {
+                key: 'title',
+                style: { fontSize: '0.875rem', fontWeight: '500', color: theme.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
+              }, book.title),
+              book.chapters.length > 1 && React.createElement('select', {
+                key: 'chapters',
+                value: chapterIndex,
+                onChange: (e) => handleChapterChange(Number(e.target.value)),
+                style: {
+                  marginTop: '0.25rem',
+                  fontSize: '0.75rem',
+                  backgroundColor: 'transparent',
+                  border: 'none',
+                  outline: 'none',
+                  cursor: 'pointer',
+                  color: theme.muted,
+                  maxWidth: '200px',
+                }
+              }, book.chapters.map((ch, idx) =>
+                React.createElement('option', {
+                  key: ch.id,
+                  value: idx,
+                  style: { backgroundColor: theme.bg, color: theme.text }
+                }, ch.title)
+              )),
+            ]),
+            React.createElement('button', {
+              key: 'close',
+              onClick: handleCloseBook,
+              style: { fontSize: '0.75rem', padding: '0.25rem 0.75rem', borderRadius: '4px', backgroundColor: theme.button, color: theme.muted, border: 'none', cursor: 'pointer' }
+            }, 'Close'),
+          ]),
+
+          // Progress info
+          React.createElement('div', {
+            key: 'progressinfo',
+            style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem', color: theme.muted }
+          }, [
+            React.createElement('span', { key: 'left', style: { fontSize: '0.75rem', fontWeight: '500' } },
+              `${book ? `Ch ${chapterIndex + 1}/${book.chapters.length}` : 'Demo'} · Sent ${currentSentenceNum}/${sentences.length}`
+            ),
+            React.createElement('span', { key: 'right', style: { fontSize: '0.75rem', fontWeight: '500' } },
+              timeRemaining > 0 ? `${timeRemaining}m left` : 'Done'
+            ),
+          ]),
+
+          // Progress bar
+          React.createElement('div', {
+            key: 'progressbar',
+            style: { height: '4px', borderRadius: '2px', overflow: 'hidden', backgroundColor: theme.cardBorder }
+          }, React.createElement('div', {
+            style: { height: '100%', width: `${progress}%`, backgroundColor: theme.accent, transition: 'width 0.2s ease-out' }
+          })),
+        ]),
+
+        // Word display
+        React.createElement('div', {
+          key: 'display',
+          style: {
+            flex: 1,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: '1rem',
+            minHeight: '220px',
+          }
+        }, showTextInput
+          ? React.createElement('div', { style: { width: '100%', maxWidth: '32rem' } },
+              React.createElement('textarea', {
+                value: inputText,
+                onChange: (e) => setInputText(e.target.value),
+                autoFocus: true,
+                placeholder: 'Paste your text here...',
+                style: {
+                  width: '100%',
+                  height: '14rem',
+                  padding: '1rem',
+                  borderRadius: '0.75rem',
+                  fontSize: '0.9375rem',
+                  lineHeight: '1.6',
+                  resize: 'none',
+                  backgroundColor: theme.card,
+                  color: theme.text,
+                  border: `1px solid ${theme.cardBorder}`,
+                  outline: 'none',
+                }
+              })
+            )
+          : loadError
+            ? React.createElement('div', { style: { textAlign: 'center', padding: '1.5rem' } }, [
+                React.createElement('div', { key: 'err', style: { color: '#f87171', marginBottom: '0.5rem' } }, `⚠️ ${loadError}`),
+                React.createElement('button', {
+                  key: 'dismiss',
+                  onClick: () => setLoadError(null),
+                  style: { fontSize: '0.875rem', textDecoration: 'underline', color: theme.muted, background: 'none', border: 'none', cursor: 'pointer' }
+                }, 'Dismiss'),
+              ])
+            : renderWord()
+        ),
+
+        // Controls
+        React.createElement('div', {
+          key: 'controls',
+          style: { padding: '0 1rem 1.25rem' }
+        }, React.createElement('div', {
+          style: {
+            maxWidth: '28rem',
+            margin: '0 auto',
+            padding: '1rem',
+            borderRadius: '1rem',
+            backgroundColor: theme.card,
+            border: `1px solid ${theme.cardBorder}`,
+          }
+        }, [
+          // Play/Reset
+          React.createElement('div', {
+            key: 'playrow',
+            style: { display: 'flex', justifyContent: 'center', gap: '0.75rem', marginBottom: '0.75rem' }
+          }, [
+            React.createElement('button', {
+              key: 'play',
+              onClick: handlePlayPause,
+              style: {
+                ...buttonStyle,
+                backgroundColor: isPlaying ? 'transparent' : theme.accent,
+                color: isPlaying ? theme.accent : '#ffffff',
+                border: isPlaying ? `2px solid ${theme.accent}` : 'none',
+                padding: '12px 28px',
+                fontWeight: '600',
+              }
+            }, isPlaying ? 'Pause' : 'Play'),
+            React.createElement('button', { key: 'reset', onClick: handleReset, style: buttonStyle }, 'Reset'),
+          ]),
+
+          // Sentence nav
+          React.createElement('div', {
+            key: 'navrow',
+            style: { display: 'flex', justifyContent: 'center', gap: '0.75rem', marginBottom: '0.75rem' }
+          }, [
+            React.createElement('button', { key: 'prev', onClick: handleBackSentence, style: buttonStyle }, '← Prev'),
+            React.createElement('button', { key: 'next', onClick: handleForwardSentence, style: buttonStyle }, 'Next →'),
+          ]),
+
+          // Settings
+          React.createElement('div', {
+            key: 'settings',
+            style: { display: 'flex', justifyContent: 'center', gap: '0.5rem', marginBottom: '1rem', flexWrap: 'wrap' }
+          }, [
+            React.createElement('button', {
+              key: 'open',
+              onClick: () => fileInputRef.current?.click(),
+              style: { ...buttonStyle, padding: '10px 14px', fontSize: '13px' }
+            }, '📁 Open'),
+            React.createElement('button', {
+              key: 'paste',
+              onClick: handleSetText,
+              style: { ...buttonStyle, padding: '10px 14px', fontSize: '13px' }
+            }, showTextInput ? '✓ Save' : '📝 Paste'),
+            React.createElement('button', {
+              key: 'theme',
+              onClick: () => setDarkMode(!darkMode),
+              style: { ...buttonStyle, padding: '10px 14px', fontSize: '13px' }
+            }, darkMode ? '☀️' : '🌙'),
+            React.createElement('button', {
+              key: 'pauses',
+              onClick: () => setPausesEnabled(!pausesEnabled),
+              style: { ...buttonStyle, padding: '10px 14px', fontSize: '13px', opacity: pausesEnabled ? 1 : 0.5 }
+            }, pausesEnabled ? '⏸ On' : '⏸ Off'),
+          ]),
+
+          // WPM
+          React.createElement('div', {
+            key: 'wpm',
+            style: { display: 'flex', alignItems: 'center', gap: '1rem' }
+          }, [
+            React.createElement('div', {
+              key: 'wpmlabel',
+              style: { textAlign: 'center', minWidth: '50px' }
+            }, [
+              React.createElement('div', { key: 'val', style: { fontSize: '1.5rem', fontWeight: '700', color: theme.text } }, wpm),
+              React.createElement('div', { key: 'label', style: { fontSize: '0.7rem', textTransform: 'uppercase', letterSpacing: '0.05em', color: theme.muted } }, 'WPM'),
+            ]),
+            React.createElement('input', {
+              key: 'slider',
+              type: 'range',
+              min: 100,
+              max: 1000,
+              step: 25,
+              value: wpm,
+              onChange: (e) => setWpm(Number(e.target.value)),
+              style: { flex: 1, height: '4px', borderRadius: '2px', backgroundColor: theme.cardBorder, cursor: 'pointer' }
+            }),
+          ]),
+        ])),
+
+        // Hidden file input
+        React.createElement('input', {
+          key: 'fileinput',
+          ref: fileInputRef,
+          type: 'file',
+          accept: '.epub',
+          onChange: handleFileSelect,
+          style: { display: 'none' }
+        }),
+      ]);
+    }
+
+    // Mount app
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(React.createElement(SpeedReader));
+
+    // Register service worker
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('sw.js').catch(() => {});
+    }
+  </script>
+</body>
+</html>
