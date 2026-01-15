@@ -34,6 +34,7 @@
     body {
       font-family: 'Inter', system-ui, sans-serif;
       -webkit-font-smoothing: antialiased;
+      background-color: #0a0a0a;
     }
     
     /* Range input styling */
@@ -109,7 +110,8 @@
   </style>
 </head>
 <body>
-  <div id="root"></div>
+  <div id="root"><div style="display:flex;align-items:center;justify-content:center;min-height:100vh;color:#666;">Loading...</div></div>
+  <noscript><div style="padding:2rem;text-align:center;color:#ef4444;">JavaScript is required to run this app.</div></noscript>
   
   <!-- React -->
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
@@ -119,6 +121,16 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
   
   <script>
+    // Check dependencies loaded
+    if (typeof React === 'undefined' || typeof ReactDOM === 'undefined') {
+      document.getElementById('root').innerHTML = '<div style="color: #ef4444; padding: 2rem; text-align: center;">Failed to load React. Check your internet connection.</div>';
+      throw new Error('React not loaded');
+    }
+    if (typeof JSZip === 'undefined') {
+      document.getElementById('root').innerHTML = '<div style="color: #ef4444; padding: 2rem; text-align: center;">Failed to load JSZip. Check your internet connection.</div>';
+      throw new Error('JSZip not loaded');
+    }
+
     // ============================================================
     // CONSTANTS & SPECIAL MARKERS
     // ============================================================
@@ -866,8 +878,18 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
         // Don't handle during splash or text input
         if (state.showChapterSplash || state.showTextInput || state.loadError) return;
         
+        // Get click/touch position - handle both mouse and touch events
         const rect = e.currentTarget.getBoundingClientRect();
-        const x = e.clientX - rect.left;
+        let clientX;
+        if (e.touches && e.touches.length > 0) {
+          clientX = e.touches[0].clientX;
+        } else if (e.changedTouches && e.changedTouches.length > 0) {
+          clientX = e.changedTouches[0].clientX;
+        } else {
+          clientX = e.clientX;
+        }
+        
+        const x = clientX - rect.left;
         const width = rect.width;
         const zone = x / width;
         
@@ -1411,9 +1433,23 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
       ]);
     }
 
-    // Mount app
-    const root = ReactDOM.createRoot(document.getElementById('root'));
-    root.render(React.createElement(SpeedReader));
+    // Mount app with error handling
+    try {
+      const root = ReactDOM.createRoot(document.getElementById('root'));
+      root.render(React.createElement(SpeedReader));
+    } catch (err) {
+      document.getElementById('root').innerHTML = '<div style="color: #ef4444; padding: 2rem; text-align: center;"><h2>Error loading app</h2><p>' + err.message + '</p></div>';
+      console.error('Mount error:', err);
+    }
+
+    // Global error handler for uncaught errors
+    window.onerror = function(msg, url, line, col, error) {
+      console.error('Global error:', msg, 'at', line + ':' + col);
+      const root = document.getElementById('root');
+      if (root && !root.innerHTML.trim()) {
+        root.innerHTML = '<div style="color: #ef4444; padding: 2rem; text-align: center;"><h2>Error</h2><p>' + msg + '</p></div>';
+      }
+    };
 
     // Register service worker
     if ('serviceWorker' in navigator) {
