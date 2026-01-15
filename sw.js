@@ -1,4 +1,4 @@
-const CACHE_NAME = 'speedreader-v2';
+const CACHE_NAME = 'speedreader-v3';
 const ASSETS = [
   './',
   './index.html',

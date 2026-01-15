@@ -107,6 +107,32 @@
       0%, 100% { opacity: 0.6; }
       50% { opacity: 0.9; }
     }
+    
+    /* Navigation feedback animation */
+    @keyframes navFeedbackPop {
+      0% { 
+        opacity: 0; 
+        transform: translateX(-50%) scale(0.5);
+      }
+      20% { 
+        opacity: 1; 
+        transform: translateX(-50%) scale(1.1);
+      }
+      100% { 
+        opacity: 1; 
+        transform: translateX(-50%) scale(1);
+      }
+    }
+    
+    @keyframes navFeedbackSlideLeft {
+      0% { transform: translateX(-50%) translateX(20px); opacity: 0; }
+      100% { transform: translateX(-50%) translateX(0); opacity: 1; }
+    }
+    
+    @keyframes navFeedbackSlideRight {
+      0% { transform: translateX(-50%) translateX(-20px); opacity: 0; }
+      100% { transform: translateX(-50%) translateX(0); opacity: 1; }
+    }
   </style>
 </head>
 <body>
@@ -410,6 +436,12 @@
       // NEW: Focus mode state (hides all UI except word)
       const [focusMode, setFocusMode] = useState(false);
       
+      // NEW: Navigation feedback state (shows +1, -2, etc on nav)
+      const [navFeedback, setNavFeedback] = useState(null); // { direction: 'forward'|'back', count: 1 }
+      const navFeedbackTimeoutRef = useRef(null);
+      const navCountRef = useRef(0);
+      const navDirectionRef = useRef(null);
+      
       const intervalRef = useRef(null);
       const fileInputRef = useRef(null);
       const saveIntervalRef = useRef(null);
@@ -706,7 +738,32 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
         setInDialogue(false);
       };
 
-      const handleBackSentence = () => {
+      // Show navigation feedback with stacking count
+      const showNavFeedback = useCallback((direction) => {
+        // Clear existing timeout
+        if (navFeedbackTimeoutRef.current) {
+          clearTimeout(navFeedbackTimeoutRef.current);
+        }
+        
+        // If same direction, increment count; otherwise reset
+        if (navDirectionRef.current === direction) {
+          navCountRef.current += 1;
+        } else {
+          navCountRef.current = 1;
+          navDirectionRef.current = direction;
+        }
+        
+        setNavFeedback({ direction, count: navCountRef.current });
+        
+        // Clear after 800ms of no activity
+        navFeedbackTimeoutRef.current = setTimeout(() => {
+          setNavFeedback(null);
+          navCountRef.current = 0;
+          navDirectionRef.current = null;
+        }, 800);
+      }, []);
+
+      const handleBackSentence = useCallback(() => {
         const currentSentenceIdx = getCurrentSentence();
         const currentSentence = sentences[currentSentenceIdx];
         
@@ -718,15 +775,17 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
         
         // Reset dialogue state when navigating (simplified approach)
         setInDialogue(false);
-      };
+        showNavFeedback('back');
+      }, [getCurrentSentence, sentences, currentIndex, showNavFeedback]);
 
-      const handleForwardSentence = () => {
+      const handleForwardSentence = useCallback(() => {
         const currentSentenceIdx = getCurrentSentence();
         
         if (currentSentenceIdx < sentences.length - 1) {
           setCurrentIndex(sentences[currentSentenceIdx + 1].start);
+          showNavFeedback('forward');
         }
-      };
+      }, [getCurrentSentence, sentences, showNavFeedback]);
 
       const handleChapterChange = (newIndex) => {
         setIsPlaying(false);
@@ -778,6 +837,7 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
         loadError,
         getCurrentSentence,
         triggerChapterSplash,
+        showNavFeedback,
       };
 
       // ============================================================
@@ -815,6 +875,7 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
                   setCurrentIndex(state.sentences[currentSentenceIdx - 1].start);
                 }
                 setInDialogue(false);
+                state.showNavFeedback('back');
               }
               break;
             case 'ArrowRight':
@@ -824,6 +885,7 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
                 const currentSentenceIdx = state.getCurrentSentence();
                 if (currentSentenceIdx < state.sentences.length - 1) {
                   setCurrentIndex(state.sentences[currentSentenceIdx + 1].start);
+                  state.showNavFeedback('forward');
                 }
               }
               break;
@@ -903,11 +965,13 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
             setCurrentIndex(state.sentences[currentSentenceIdx - 1].start);
           }
           setInDialogue(false);
+          state.showNavFeedback('back');
         } else if (zone > 0.67) {
           // Right third - go forward
           const currentSentenceIdx = state.getCurrentSentence();
           if (currentSentenceIdx < state.sentences.length - 1) {
             setCurrentIndex(state.sentences[currentSentenceIdx + 1].start);
+            state.showNavFeedback('forward');
           }
         } else {
           // Center - play/pause
@@ -1092,6 +1156,86 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
       };
 
       // ============================================================
+      // Navigation feedback indicator (+1, +2, etc)
+      // ============================================================
+      const renderNavFeedback = () => {
+        if (!navFeedback) return null;
+        
+        const isBack = navFeedback.direction === 'back';
+        const arrow = isBack ? '←' : '→';
+        const sign = isBack ? '-' : '+';
+        
+        return React.createElement('div', {
+          key: 'nav-feedback-' + navFeedback.count + navFeedback.direction,
+          style: {
+            position: 'absolute',
+            bottom: focusMode ? '5rem' : '1rem',
+            left: '50%',
+            transform: 'translateX(-50%)',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.5rem',
+            padding: '0.5rem 1rem',
+            borderRadius: '999px',
+            backgroundColor: darkMode ? 'rgba(255, 255, 255, 0.15)' : 'rgba(0, 0, 0, 0.1)',
+            border: `1px solid ${darkMode ? 'rgba(255, 255, 255, 0.2)' : 'rgba(0, 0, 0, 0.15)'}`,
+            animation: isBack ? 'navFeedbackSlideRight 0.2s ease-out' : 'navFeedbackSlideLeft 0.2s ease-out',
+            pointerEvents: 'none',
+          }
+        }, [
+          React.createElement('span', {
+            key: 'arrow',
+            style: { 
+              fontSize: '1.25rem', 
+              fontWeight: '600',
+              color: darkMode ? '#ffffff' : '#1a1a1a',
+            }
+          }, arrow),
+          React.createElement('span', {
+            key: 'count',
+            style: {
+              fontSize: '1.125rem',
+              fontWeight: '700',
+              color: '#ef4444',
+            }
+          }, sign + navFeedback.count),
+        ]);
+      };
+
+      // ============================================================
+      // Focus mode exit button (for mobile)
+      // ============================================================
+      const renderFocusModeExit = () => {
+        if (!focusMode) return null;
+        
+        return React.createElement('button', {
+          key: 'focus-exit',
+          onClick: (e) => {
+            e.stopPropagation();
+            setFocusMode(false);
+          },
+          style: {
+            position: 'absolute',
+            top: '1rem',
+            right: '1rem',
+            width: '44px',
+            height: '44px',
+            borderRadius: '50%',
+            backgroundColor: darkMode ? 'rgba(255, 255, 255, 0.1)' : 'rgba(0, 0, 0, 0.1)',
+            border: `1px solid ${darkMode ? 'rgba(255, 255, 255, 0.2)' : 'rgba(0, 0, 0, 0.15)'}`,
+            color: darkMode ? 'rgba(255, 255, 255, 0.6)' : 'rgba(0, 0, 0, 0.5)',
+            fontSize: '1.25rem',
+            fontWeight: '300',
+            cursor: 'pointer',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 210,
+          }
+        }, '✕');
+      };
+
+      // ============================================================
       // Calculate progress stats (excluding paragraph markers)
       // ============================================================
       const actualWords = words.filter(w => w !== PARAGRAPH_MARKER);
@@ -1270,6 +1414,12 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
           // Dialogue indicator (hidden in focus mode)
           !focusMode && renderDialogueIndicator(),
           
+          // Navigation feedback indicator
+          renderNavFeedback(),
+          
+          // Focus mode exit button (for mobile)
+          renderFocusModeExit(),
+          
           // Focus mode exit hint
           focusMode && React.createElement('div', {
             key: 'focus-hint',
@@ -1282,7 +1432,7 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
               color: darkMode ? 'rgba(255,255,255,0.2)' : 'rgba(0,0,0,0.2)',
               textAlign: 'center',
             }
-          }, 'Press F or Esc to exit · Tap: ← center → '),
+          }, 'Tap ✕ or press Esc to exit · Tap: ← center → '),
           
           // Main content
           showTextInput
