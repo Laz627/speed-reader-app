@@ -822,8 +822,15 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
       };
 
       // ============================================================
-      // Refs for keyboard handler (to avoid stale closures)
+      // Refs for handlers (to avoid stale closures in keyboard listener)
       // ============================================================
+      const handlersRef = useRef({});
+      handlersRef.current = {
+        handleBackSentence,
+        handleForwardSentence,
+        triggerChapterSplash,
+      };
+      
       const stateRef = useRef({});
       stateRef.current = {
         book,
@@ -835,9 +842,7 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
         showChapterSplash,
         showTextInput,
         loadError,
-        getCurrentSentence,
-        triggerChapterSplash,
-        showNavFeedback,
+        focusMode,
       };
 
       // ============================================================
@@ -851,6 +856,7 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
           if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
           
           const state = stateRef.current;
+          const handlers = handlersRef.current;
           
           switch (e.code) {
             case 'Space':
@@ -865,28 +871,14 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
               break;
             case 'ArrowLeft':
               e.preventDefault();
-              // Go back a sentence
-              {
-                const currentSentenceIdx = state.getCurrentSentence();
-                const currentSentence = state.sentences[currentSentenceIdx];
-                if (state.currentIndex > currentSentence?.start) {
-                  setCurrentIndex(currentSentence.start);
-                } else if (currentSentenceIdx > 0) {
-                  setCurrentIndex(state.sentences[currentSentenceIdx - 1].start);
-                }
-                setInDialogue(false);
-                state.showNavFeedback('back');
+              if (handlers.handleBackSentence) {
+                handlers.handleBackSentence();
               }
               break;
             case 'ArrowRight':
               e.preventDefault();
-              // Go forward a sentence
-              {
-                const currentSentenceIdx = state.getCurrentSentence();
-                if (currentSentenceIdx < state.sentences.length - 1) {
-                  setCurrentIndex(state.sentences[currentSentenceIdx + 1].start);
-                  state.showNavFeedback('forward');
-                }
+              if (handlers.handleForwardSentence) {
+                handlers.handleForwardSentence();
               }
               break;
             case 'ArrowUp':
@@ -897,7 +889,9 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
                 setChapterIndex(newChapter);
                 setCurrentIndex(0);
                 setInDialogue(false);
-                state.triggerChapterSplash(newChapter, false);
+                if (handlers.triggerChapterSplash) {
+                  handlers.triggerChapterSplash(newChapter, false);
+                }
               }
               break;
             case 'ArrowDown':
@@ -908,7 +902,9 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
                 setChapterIndex(newChapter);
                 setCurrentIndex(0);
                 setInDialogue(false);
-                state.triggerChapterSplash(newChapter, false);
+                if (handlers.triggerChapterSplash) {
+                  handlers.triggerChapterSplash(newChapter, false);
+                }
               }
               break;
             case 'KeyF':
@@ -924,7 +920,7 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
         
         window.addEventListener('keydown', handleKeyDown);
         return () => window.removeEventListener('keydown', handleKeyDown);
-      }, []); // Empty deps - handler uses ref for current values
+      }, []); // Empty deps - uses refs for current values
 
       // ============================================================
       // Tap zone handler for mobile
@@ -936,6 +932,7 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
             e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
         
         const state = stateRef.current;
+        const handlers = handlersRef.current;
         
         // Don't handle during splash or text input
         if (state.showChapterSplash || state.showTextInput || state.loadError) return;
@@ -957,21 +954,13 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
         
         if (zone < 0.33) {
           // Left third - go back
-          const currentSentenceIdx = state.getCurrentSentence();
-          const currentSentence = state.sentences[currentSentenceIdx];
-          if (state.currentIndex > currentSentence?.start) {
-            setCurrentIndex(currentSentence.start);
-          } else if (currentSentenceIdx > 0) {
-            setCurrentIndex(state.sentences[currentSentenceIdx - 1].start);
+          if (handlers.handleBackSentence) {
+            handlers.handleBackSentence();
           }
-          setInDialogue(false);
-          state.showNavFeedback('back');
         } else if (zone > 0.67) {
           // Right third - go forward
-          const currentSentenceIdx = state.getCurrentSentence();
-          if (currentSentenceIdx < state.sentences.length - 1) {
-            setCurrentIndex(state.sentences[currentSentenceIdx + 1].start);
-            state.showNavFeedback('forward');
+          if (handlers.handleForwardSentence) {
+            handlers.handleForwardSentence();
           }
         } else {
           // Center - play/pause
@@ -1166,7 +1155,7 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
         const sign = isBack ? '-' : '+';
         
         return React.createElement('div', {
-          key: 'nav-feedback-' + navFeedback.count + navFeedback.direction,
+          key: 'nav-feedback-' + Date.now(),
           style: {
             position: 'absolute',
             bottom: focusMode ? '5rem' : '1rem',
@@ -1175,27 +1164,28 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
             display: 'flex',
             alignItems: 'center',
             gap: '0.5rem',
-            padding: '0.5rem 1rem',
+            padding: '0.625rem 1.25rem',
             borderRadius: '999px',
-            backgroundColor: darkMode ? 'rgba(255, 255, 255, 0.15)' : 'rgba(0, 0, 0, 0.1)',
-            border: `1px solid ${darkMode ? 'rgba(255, 255, 255, 0.2)' : 'rgba(0, 0, 0, 0.15)'}`,
-            animation: isBack ? 'navFeedbackSlideRight 0.2s ease-out' : 'navFeedbackSlideLeft 0.2s ease-out',
+            backgroundColor: darkMode ? 'rgba(255, 255, 255, 0.2)' : 'rgba(0, 0, 0, 0.15)',
+            border: `2px solid ${darkMode ? 'rgba(255, 255, 255, 0.3)' : 'rgba(0, 0, 0, 0.2)'}`,
+            animation: isBack ? 'navFeedbackSlideRight 0.15s ease-out' : 'navFeedbackSlideLeft 0.15s ease-out',
             pointerEvents: 'none',
+            zIndex: 100,
           }
         }, [
           React.createElement('span', {
             key: 'arrow',
             style: { 
-              fontSize: '1.25rem', 
-              fontWeight: '600',
+              fontSize: '1.5rem', 
+              fontWeight: '700',
               color: darkMode ? '#ffffff' : '#1a1a1a',
             }
           }, arrow),
           React.createElement('span', {
             key: 'count',
             style: {
-              fontSize: '1.125rem',
-              fontWeight: '700',
+              fontSize: '1.375rem',
+              fontWeight: '800',
               color: '#ef4444',
             }
           }, sign + navFeedback.count),
@@ -1211,6 +1201,7 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
         return React.createElement('button', {
           key: 'focus-exit',
           onClick: (e) => {
+            e.preventDefault();
             e.stopPropagation();
             setFocusMode(false);
           },
@@ -1218,19 +1209,22 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
             position: 'absolute',
             top: '1rem',
             right: '1rem',
-            width: '44px',
-            height: '44px',
+            width: '48px',
+            height: '48px',
             borderRadius: '50%',
-            backgroundColor: darkMode ? 'rgba(255, 255, 255, 0.1)' : 'rgba(0, 0, 0, 0.1)',
-            border: `1px solid ${darkMode ? 'rgba(255, 255, 255, 0.2)' : 'rgba(0, 0, 0, 0.15)'}`,
-            color: darkMode ? 'rgba(255, 255, 255, 0.6)' : 'rgba(0, 0, 0, 0.5)',
-            fontSize: '1.25rem',
-            fontWeight: '300',
+            backgroundColor: darkMode ? 'rgba(255, 255, 255, 0.2)' : 'rgba(0, 0, 0, 0.15)',
+            border: `2px solid ${darkMode ? 'rgba(255, 255, 255, 0.4)' : 'rgba(0, 0, 0, 0.3)'}`,
+            color: darkMode ? 'rgba(255, 255, 255, 0.9)' : 'rgba(0, 0, 0, 0.7)',
+            fontSize: '1.5rem',
+            fontWeight: '400',
             cursor: 'pointer',
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
-            zIndex: 210,
+            zIndex: 250,
+            outline: 'none',
+            WebkitAppearance: 'none',
+            touchAction: 'manipulation',
           }
         }, '✕');
       };
@@ -1472,91 +1466,28 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
         // Controls (hidden in focus mode)
         !focusMode && React.createElement('div', {
           key: 'controls',
-          style: { padding: '0 1rem 1.25rem' }
+          style: { padding: '0 1rem 1rem' }
         }, React.createElement('div', {
           style: {
-            maxWidth: '28rem',
+            maxWidth: '24rem',
             margin: '0 auto',
-            padding: '1rem',
+            padding: '0.875rem',
             borderRadius: '1rem',
             backgroundColor: theme.card,
             border: `1px solid ${theme.cardBorder}`,
           }
         }, [
-          // Play/Reset
-          React.createElement('div', {
-            key: 'playrow',
-            style: { display: 'flex', justifyContent: 'center', gap: '0.75rem', marginBottom: '0.75rem' }
-          }, [
-            React.createElement('button', {
-              key: 'play',
-              onClick: handlePlayPause,
-              disabled: showChapterSplash,
-              style: {
-                ...buttonStyle,
-                backgroundColor: isPlaying ? 'transparent' : theme.accent,
-                color: isPlaying ? theme.accent : '#ffffff',
-                border: isPlaying ? `2px solid ${theme.accent}` : 'none',
-                padding: '12px 28px',
-                fontWeight: '600',
-                opacity: showChapterSplash ? 0.5 : 1,
-              }
-            }, isPlaying ? 'Pause' : 'Play'),
-            React.createElement('button', { key: 'reset', onClick: handleReset, style: buttonStyle }, 'Reset'),
-          ]),
-
-          // Sentence nav
-          React.createElement('div', {
-            key: 'navrow',
-            style: { display: 'flex', justifyContent: 'center', gap: '0.75rem', marginBottom: '0.75rem' }
-          }, [
-            React.createElement('button', { key: 'prev', onClick: handleBackSentence, style: buttonStyle }, '← Prev'),
-            React.createElement('button', { key: 'next', onClick: handleForwardSentence, style: buttonStyle }, 'Next →'),
-          ]),
-
-          // Settings
-          React.createElement('div', {
-            key: 'settings',
-            style: { display: 'flex', justifyContent: 'center', gap: '0.5rem', marginBottom: '1rem', flexWrap: 'wrap' }
-          }, [
-            React.createElement('button', {
-              key: 'open',
-              onClick: () => fileInputRef.current?.click(),
-              style: { ...buttonStyle, padding: '10px 14px', fontSize: '13px' }
-            }, '📁 Open'),
-            React.createElement('button', {
-              key: 'paste',
-              onClick: handleSetText,
-              style: { ...buttonStyle, padding: '10px 14px', fontSize: '13px' }
-            }, showTextInput ? '✓ Save' : '📝 Paste'),
-            React.createElement('button', {
-              key: 'theme',
-              onClick: () => setDarkMode(!darkMode),
-              style: { ...buttonStyle, padding: '10px 14px', fontSize: '13px' }
-            }, darkMode ? '☀️' : '🌙'),
-            React.createElement('button', {
-              key: 'pauses',
-              onClick: () => setPausesEnabled(!pausesEnabled),
-              style: { ...buttonStyle, padding: '10px 14px', fontSize: '13px', opacity: pausesEnabled ? 1 : 0.5 }
-            }, pausesEnabled ? '⏸ On' : '⏸ Off'),
-            React.createElement('button', {
-              key: 'focus',
-              onClick: () => setFocusMode(true),
-              style: { ...buttonStyle, padding: '10px 14px', fontSize: '13px' }
-            }, '⛶ Focus'),
-          ]),
-
-          // WPM
+          // WPM slider row (most important - at top)
           React.createElement('div', {
             key: 'wpm',
-            style: { display: 'flex', alignItems: 'center', gap: '1rem' }
+            style: { display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '0.75rem' }
           }, [
             React.createElement('div', {
               key: 'wpmlabel',
-              style: { textAlign: 'center', minWidth: '50px' }
+              style: { textAlign: 'center', minWidth: '44px' }
             }, [
-              React.createElement('div', { key: 'val', style: { fontSize: '1.5rem', fontWeight: '700', color: theme.text } }, wpm),
-              React.createElement('div', { key: 'label', style: { fontSize: '0.7rem', textTransform: 'uppercase', letterSpacing: '0.05em', color: theme.muted } }, 'WPM'),
+              React.createElement('div', { key: 'val', style: { fontSize: '1.25rem', fontWeight: '700', color: theme.text, lineHeight: 1 } }, wpm),
+              React.createElement('div', { key: 'label', style: { fontSize: '0.6rem', textTransform: 'uppercase', letterSpacing: '0.05em', color: theme.muted } }, 'WPM'),
             ]),
             React.createElement('input', {
               key: 'slider',
@@ -1568,6 +1499,81 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
               onChange: (e) => setWpm(Number(e.target.value)),
               style: { flex: 1, height: '4px', borderRadius: '2px', backgroundColor: theme.cardBorder, cursor: 'pointer' }
             }),
+          ]),
+
+          // Main controls row: Play + Nav
+          React.createElement('div', {
+            key: 'mainrow',
+            style: { display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '0.5rem', marginBottom: '0.75rem' }
+          }, [
+            React.createElement('button', { 
+              key: 'prev', 
+              onClick: handleBackSentence, 
+              style: { ...buttonStyle, padding: '10px 16px', fontSize: '16px', minWidth: '48px' } 
+            }, '←'),
+            React.createElement('button', {
+              key: 'play',
+              onClick: handlePlayPause,
+              disabled: showChapterSplash,
+              style: {
+                ...buttonStyle,
+                backgroundColor: isPlaying ? 'transparent' : theme.accent,
+                color: isPlaying ? theme.accent : '#ffffff',
+                border: isPlaying ? `2px solid ${theme.accent}` : 'none',
+                padding: '10px 24px',
+                fontWeight: '600',
+                fontSize: '14px',
+                opacity: showChapterSplash ? 0.5 : 1,
+              }
+            }, isPlaying ? 'Pause' : 'Play'),
+            React.createElement('button', { 
+              key: 'next', 
+              onClick: handleForwardSentence, 
+              style: { ...buttonStyle, padding: '10px 16px', fontSize: '16px', minWidth: '48px' } 
+            }, '→'),
+          ]),
+
+          // Secondary controls: compact icon row
+          React.createElement('div', {
+            key: 'secondary',
+            style: { display: 'flex', justifyContent: 'center', gap: '0.375rem', flexWrap: 'wrap' }
+          }, [
+            React.createElement('button', {
+              key: 'open',
+              onClick: () => fileInputRef.current?.click(),
+              title: 'Open EPUB',
+              style: { ...buttonStyle, padding: '8px 12px', fontSize: '14px', minWidth: '42px' }
+            }, '📁'),
+            React.createElement('button', {
+              key: 'paste',
+              onClick: handleSetText,
+              title: showTextInput ? 'Save text' : 'Paste text',
+              style: { ...buttonStyle, padding: '8px 12px', fontSize: '14px', minWidth: '42px' }
+            }, showTextInput ? '✓' : '📝'),
+            React.createElement('button', {
+              key: 'reset',
+              onClick: handleReset,
+              title: 'Reset to start',
+              style: { ...buttonStyle, padding: '8px 12px', fontSize: '14px', minWidth: '42px' }
+            }, '↺'),
+            React.createElement('button', {
+              key: 'theme',
+              onClick: () => setDarkMode(!darkMode),
+              title: 'Toggle theme',
+              style: { ...buttonStyle, padding: '8px 12px', fontSize: '14px', minWidth: '42px' }
+            }, darkMode ? '☀️' : '🌙'),
+            React.createElement('button', {
+              key: 'pauses',
+              onClick: () => setPausesEnabled(!pausesEnabled),
+              title: 'Toggle smart pauses',
+              style: { ...buttonStyle, padding: '8px 12px', fontSize: '14px', minWidth: '42px', opacity: pausesEnabled ? 1 : 0.5 }
+            }, '⏸'),
+            React.createElement('button', {
+              key: 'focus',
+              onClick: () => setFocusMode(true),
+              title: 'Focus mode',
+              style: { ...buttonStyle, padding: '8px 12px', fontSize: '14px', minWidth: '42px' }
+            }, '⛶'),
           ]),
         ])),
 
