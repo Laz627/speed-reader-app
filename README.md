@@ -27,10 +27,38 @@ A Progressive Web App for speed reading EPUB files using RSVP (Rapid Serial Visu
 
 1. Visit the hosted app or open `index.html` locally
 2. Drop an EPUB file onto the page (or use the Open button)
-3. Press Play to start reading
+3. Press Play to start reading (or press Space)
 4. Adjust WPM with the slider
 5. Use Prev/Next to navigate sentences
 6. Toggle the ⏸ button to enable/disable smart pauses
+7. Press F or tap the Focus button for distraction-free reading
+
+### Keyboard Shortcuts
+
+| Key | Action |
+|-----|--------|
+| Space | Play / Pause |
+| ← | Previous sentence |
+| → | Next sentence |
+| ↑ | Previous chapter |
+| ↓ | Next chapter |
+| F | Toggle focus mode |
+| Esc | Exit focus mode |
+
+### Mobile Tap Zones
+
+In the word display area:
+- **Left third** → Go back one sentence
+- **Center third** → Play / Pause
+- **Right third** → Go forward one sentence
+
+### Focus Mode
+
+Press F or tap the Focus button to enter a distraction-free mode:
+- Full black/white screen with just the word
+- All UI hidden
+- Tap zones still work for navigation
+- Press F, Esc, or tap center to exit
 
 ## Deploy to GitHub Pages
 
@@ -93,6 +121,11 @@ Since Amazon removed "Download & Transfer via USB" in February 2025, use this wo
 Replace `icon-192.png` and `icon-512.png` with your own app icons (must be square PNG files at those dimensions).
 
 ## Changelog
+
+### v2.1.0
+- **Keyboard Shortcuts**: Space for play/pause, arrow keys for navigation, F for focus mode
+- **Mobile Tap Zones**: Tap left/center/right of display area for back/play/forward
+- **Focus Mode**: Distraction-free full-screen reading with just the word (press F or tap Focus button)
 
 ### v2.0.0
 - **Quote/Parenthesis Handling**: Leading and trailing punctuation is now visually separated - dimmed and slightly smaller - so the core word stands out

@@ -395,6 +395,9 @@
       // NEW: Dialogue tracking state
       const [inDialogue, setInDialogue] = useState(false);
       
+      // NEW: Focus mode state (hides all UI except word)
+      const [focusMode, setFocusMode] = useState(false);
+      
       const intervalRef = useRef(null);
       const fileInputRef = useRef(null);
       const saveIntervalRef = useRef(null);
@@ -748,6 +751,115 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
       };
 
       // ============================================================
+      // Keyboard shortcuts
+      // Space = play/pause, Left/Right = sentence nav, Up/Down = chapter
+      // F = toggle focus mode, Escape = exit focus mode
+      // ============================================================
+      useEffect(() => {
+        const handleKeyDown = (e) => {
+          // Ignore if typing in textarea
+          if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
+          
+          switch (e.code) {
+            case 'Space':
+              e.preventDefault();
+              if (!showChapterSplash) {
+                if (currentIndex >= words.length - 1 && !isPlaying) {
+                  setCurrentIndex(0);
+                  setInDialogue(false);
+                }
+                setIsPlaying(prev => !prev);
+              }
+              break;
+            case 'ArrowLeft':
+              e.preventDefault();
+              // Go back a sentence
+              {
+                const currentSentenceIdx = getCurrentSentence();
+                const currentSentence = sentences[currentSentenceIdx];
+                if (currentIndex > currentSentence?.start) {
+                  setCurrentIndex(currentSentence.start);
+                } else if (currentSentenceIdx > 0) {
+                  setCurrentIndex(sentences[currentSentenceIdx - 1].start);
+                }
+                setInDialogue(false);
+              }
+              break;
+            case 'ArrowRight':
+              e.preventDefault();
+              // Go forward a sentence
+              {
+                const currentSentenceIdx = getCurrentSentence();
+                if (currentSentenceIdx < sentences.length - 1) {
+                  setCurrentIndex(sentences[currentSentenceIdx + 1].start);
+                }
+              }
+              break;
+            case 'ArrowUp':
+              e.preventDefault();
+              if (book && chapterIndex > 0) {
+                setIsPlaying(false);
+                setChapterIndex(chapterIndex - 1);
+                setCurrentIndex(0);
+                setInDialogue(false);
+                triggerChapterSplash(chapterIndex - 1, false);
+              }
+              break;
+            case 'ArrowDown':
+              e.preventDefault();
+              if (book && chapterIndex < book.chapters.length - 1) {
+                setIsPlaying(false);
+                setChapterIndex(chapterIndex + 1);
+                setCurrentIndex(0);
+                setInDialogue(false);
+                triggerChapterSplash(chapterIndex + 1, false);
+              }
+              break;
+            case 'KeyF':
+              e.preventDefault();
+              setFocusMode(prev => !prev);
+              break;
+            case 'Escape':
+              e.preventDefault();
+              setFocusMode(false);
+              break;
+          }
+        };
+        
+        window.addEventListener('keydown', handleKeyDown);
+        return () => window.removeEventListener('keydown', handleKeyDown);
+      }, [book, chapterIndex, currentIndex, words.length, isPlaying, showChapterSplash, sentences, getCurrentSentence, triggerChapterSplash]);
+
+      // ============================================================
+      // Tap zone handler for mobile
+      // Left third = back, right third = forward, center = play/pause
+      // ============================================================
+      const handleTapZone = (e) => {
+        // Only handle taps on the display area, not buttons
+        if (e.target.tagName === 'BUTTON' || e.target.tagName === 'SELECT' || 
+            e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+        
+        // Don't handle during splash or text input
+        if (showChapterSplash || showTextInput || loadError) return;
+        
+        const rect = e.currentTarget.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const width = rect.width;
+        const zone = x / width;
+        
+        if (zone < 0.33) {
+          // Left third - go back
+          handleBackSentence();
+        } else if (zone > 0.67) {
+          // Right third - go forward
+          handleForwardSentence();
+        } else {
+          // Center - play/pause
+          handlePlayPause();
+        }
+      };
+
+      // ============================================================
       // Word rendering with punctuation separation
       // ============================================================
       const renderWord = () => {
@@ -1009,8 +1121,8 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
           React.createElement('div', { key: 'sub', style: { color: theme.muted } }, 'Parsing EPUB'),
         ])),
 
-        // Header
-        React.createElement('div', {
+        // Header (hidden in focus mode)
+        !focusMode && React.createElement('div', {
           key: 'header',
           style: { padding: '1rem 1.25rem 0.75rem' }
         }, [
@@ -1075,21 +1187,40 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
           })),
         ]),
 
-        // Word display area
+        // Word display area (with tap zones for mobile)
         React.createElement('div', {
           key: 'display',
+          onClick: handleTapZone,
           style: {
             flex: 1,
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
-            padding: '1rem',
-            minHeight: '220px',
-            position: 'relative',
+            padding: focusMode ? '0' : '1rem',
+            minHeight: focusMode ? '100vh' : '220px',
+            position: focusMode ? 'fixed' : 'relative',
+            inset: focusMode ? 0 : 'auto',
+            zIndex: focusMode ? 200 : 'auto',
+            backgroundColor: focusMode ? (darkMode ? '#000000' : '#ffffff') : 'transparent',
+            cursor: 'pointer',
           }
         }, [
-          // Dialogue indicator
-          renderDialogueIndicator(),
+          // Dialogue indicator (hidden in focus mode)
+          !focusMode && renderDialogueIndicator(),
+          
+          // Focus mode exit hint
+          focusMode && React.createElement('div', {
+            key: 'focus-hint',
+            style: {
+              position: 'absolute',
+              bottom: '2rem',
+              left: '50%',
+              transform: 'translateX(-50%)',
+              fontSize: '0.75rem',
+              color: darkMode ? 'rgba(255,255,255,0.2)' : 'rgba(0,0,0,0.2)',
+              textAlign: 'center',
+            }
+          }, 'Press F or Esc to exit · Tap: ← center → '),
           
           // Main content
           showTextInput
@@ -1126,8 +1257,8 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
               : React.createElement('div', { key: 'word' }, renderWord())
         ]),
 
-        // Controls
-        React.createElement('div', {
+        // Controls (hidden in focus mode)
+        !focusMode && React.createElement('div', {
           key: 'controls',
           style: { padding: '0 1rem 1.25rem' }
         }, React.createElement('div', {
@@ -1196,6 +1327,11 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
               onClick: () => setPausesEnabled(!pausesEnabled),
               style: { ...buttonStyle, padding: '10px 14px', fontSize: '13px', opacity: pausesEnabled ? 1 : 0.5 }
             }, pausesEnabled ? '⏸ On' : '⏸ Off'),
+            React.createElement('button', {
+              key: 'focus',
+              onClick: () => setFocusMode(true),
+              style: { ...buttonStyle, padding: '10px 14px', fontSize: '13px' }
+            }, '⛶ Focus'),
           ]),
 
           // WPM
