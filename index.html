@@ -131,8 +131,8 @@
     const TRAILING_PUNCT = /[""''»)\]}.!?,;:—–-]+$/;
     
     // Quote characters for tracking dialogue state
-    const OPEN_QUOTES = ['"', "'", '"', ''', '«', '¿', '¡'];
-    const CLOSE_QUOTES = ['"', "'", '"', ''', '»'];
+    const OPEN_QUOTES = ['"', "'", "\u201C", "\u2018", '«', '¿', '¡'];
+    const CLOSE_QUOTES = ['"', "'", "\u201D", "\u2019", '»'];
     
     // ============================================================
     // ORP (Optimal Recognition Point) Logic
@@ -751,6 +751,24 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
       };
 
       // ============================================================
+      // Refs for keyboard handler (to avoid stale closures)
+      // ============================================================
+      const stateRef = useRef({});
+      stateRef.current = {
+        book,
+        chapterIndex,
+        currentIndex,
+        words,
+        sentences,
+        isPlaying,
+        showChapterSplash,
+        showTextInput,
+        loadError,
+        getCurrentSentence,
+        triggerChapterSplash,
+      };
+
+      // ============================================================
       // Keyboard shortcuts
       // Space = play/pause, Left/Right = sentence nav, Up/Down = chapter
       // F = toggle focus mode, Escape = exit focus mode
@@ -760,11 +778,13 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
           // Ignore if typing in textarea
           if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
           
+          const state = stateRef.current;
+          
           switch (e.code) {
             case 'Space':
               e.preventDefault();
-              if (!showChapterSplash) {
-                if (currentIndex >= words.length - 1 && !isPlaying) {
+              if (!state.showChapterSplash) {
+                if (state.currentIndex >= state.words.length - 1) {
                   setCurrentIndex(0);
                   setInDialogue(false);
                 }
@@ -775,12 +795,12 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
               e.preventDefault();
               // Go back a sentence
               {
-                const currentSentenceIdx = getCurrentSentence();
-                const currentSentence = sentences[currentSentenceIdx];
-                if (currentIndex > currentSentence?.start) {
+                const currentSentenceIdx = state.getCurrentSentence();
+                const currentSentence = state.sentences[currentSentenceIdx];
+                if (state.currentIndex > currentSentence?.start) {
                   setCurrentIndex(currentSentence.start);
                 } else if (currentSentenceIdx > 0) {
-                  setCurrentIndex(sentences[currentSentenceIdx - 1].start);
+                  setCurrentIndex(state.sentences[currentSentenceIdx - 1].start);
                 }
                 setInDialogue(false);
               }
@@ -789,30 +809,32 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
               e.preventDefault();
               // Go forward a sentence
               {
-                const currentSentenceIdx = getCurrentSentence();
-                if (currentSentenceIdx < sentences.length - 1) {
-                  setCurrentIndex(sentences[currentSentenceIdx + 1].start);
+                const currentSentenceIdx = state.getCurrentSentence();
+                if (currentSentenceIdx < state.sentences.length - 1) {
+                  setCurrentIndex(state.sentences[currentSentenceIdx + 1].start);
                 }
               }
               break;
             case 'ArrowUp':
               e.preventDefault();
-              if (book && chapterIndex > 0) {
+              if (state.book && state.chapterIndex > 0) {
+                const newChapter = state.chapterIndex - 1;
                 setIsPlaying(false);
-                setChapterIndex(chapterIndex - 1);
+                setChapterIndex(newChapter);
                 setCurrentIndex(0);
                 setInDialogue(false);
-                triggerChapterSplash(chapterIndex - 1, false);
+                state.triggerChapterSplash(newChapter, false);
               }
               break;
             case 'ArrowDown':
               e.preventDefault();
-              if (book && chapterIndex < book.chapters.length - 1) {
+              if (state.book && state.chapterIndex < state.book.chapters.length - 1) {
+                const newChapter = state.chapterIndex + 1;
                 setIsPlaying(false);
-                setChapterIndex(chapterIndex + 1);
+                setChapterIndex(newChapter);
                 setCurrentIndex(0);
                 setInDialogue(false);
-                triggerChapterSplash(chapterIndex + 1, false);
+                state.triggerChapterSplash(newChapter, false);
               }
               break;
             case 'KeyF':
@@ -828,19 +850,21 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
         
         window.addEventListener('keydown', handleKeyDown);
         return () => window.removeEventListener('keydown', handleKeyDown);
-      }, [book, chapterIndex, currentIndex, words.length, isPlaying, showChapterSplash, sentences, getCurrentSentence, triggerChapterSplash]);
+      }, []); // Empty deps - handler uses ref for current values
 
       // ============================================================
       // Tap zone handler for mobile
       // Left third = back, right third = forward, center = play/pause
       // ============================================================
-      const handleTapZone = (e) => {
+      const handleTapZone = useCallback((e) => {
         // Only handle taps on the display area, not buttons
         if (e.target.tagName === 'BUTTON' || e.target.tagName === 'SELECT' || 
             e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
         
+        const state = stateRef.current;
+        
         // Don't handle during splash or text input
-        if (showChapterSplash || showTextInput || loadError) return;
+        if (state.showChapterSplash || state.showTextInput || state.loadError) return;
         
         const rect = e.currentTarget.getBoundingClientRect();
         const x = e.clientX - rect.left;
@@ -849,15 +873,31 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
         
         if (zone < 0.33) {
           // Left third - go back
-          handleBackSentence();
+          const currentSentenceIdx = state.getCurrentSentence();
+          const currentSentence = state.sentences[currentSentenceIdx];
+          if (state.currentIndex > currentSentence?.start) {
+            setCurrentIndex(currentSentence.start);
+          } else if (currentSentenceIdx > 0) {
+            setCurrentIndex(state.sentences[currentSentenceIdx - 1].start);
+          }
+          setInDialogue(false);
         } else if (zone > 0.67) {
           // Right third - go forward
-          handleForwardSentence();
+          const currentSentenceIdx = state.getCurrentSentence();
+          if (currentSentenceIdx < state.sentences.length - 1) {
+            setCurrentIndex(state.sentences[currentSentenceIdx + 1].start);
+          }
         } else {
           // Center - play/pause
-          handlePlayPause();
+          if (!state.showChapterSplash) {
+            if (state.currentIndex >= state.words.length - 1) {
+              setCurrentIndex(0);
+              setInDialogue(false);
+            }
+            setIsPlaying(prev => !prev);
+          }
         }
-      };
+      }, []);
 
       // ============================================================
       // Word rendering with punctuation separation
