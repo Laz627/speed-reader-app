@@ -437,6 +437,12 @@
       // NEW: Focus mode state (hides all UI except word)
       const [focusMode, setFocusMode] = useState(false);
       
+      // NEW: Context mode state (shows faded prev/next words)
+      const [contextMode, setContextMode] = useState(false);
+      
+      // NEW: Mobile viewport detection for responsive context layout
+      const [isMobileView, setIsMobileView] = useState(() => window.innerWidth < 640);
+      
       // NEW: Navigation feedback state (shows +1, -2, etc on nav)
       const [navFeedback, setNavFeedback] = useState(null); // { direction: 'forward'|'back', count: 1 }
       const navFeedbackTimeoutRef = useRef(null);
@@ -564,6 +570,25 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
             clearTimeout(splashTimeoutRef.current);
           }
         };
+      }, []);
+
+      // ============================================================
+      // Viewport resize listener for responsive context layout
+      // Switches between horizontal (desktop) and vertical (mobile)
+      // ============================================================
+      useEffect(() => {
+        // 640px covers most phones in portrait and smaller tablets
+        const MOBILE_BREAKPOINT = 640;
+        
+        const handleResize = () => {
+          setIsMobileView(window.innerWidth < MOBILE_BREAKPOINT);
+        };
+        
+        // Fire immediately to catch current viewport state
+        handleResize();
+        
+        window.addEventListener('resize', handleResize);
+        return () => window.removeEventListener('resize', handleResize);
       }, []);
 
       // ============================================================
@@ -844,6 +869,7 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
         showTextInput,
         loadError,
         focusMode,
+        contextMode,
       };
 
       // ============================================================
@@ -912,6 +938,10 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
               e.preventDefault();
               setFocusMode(prev => !prev);
               break;
+            case 'KeyC':
+              e.preventDefault();
+              setContextMode(prev => !prev);
+              break;
             case 'Escape':
               e.preventDefault();
               setFocusMode(false);
@@ -976,7 +1006,128 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
       }, []);
 
       // ============================================================
-      // Word rendering with punctuation separation
+      // Dynamic font scaling for long words
+      // Scales down font size for words that would overflow viewport
+      // Uses viewport width to calculate appropriate thresholds
+      // ============================================================
+      const calculateFontScale = (word) => {
+        if (!word || word === PARAGRAPH_MARKER) return 1;
+        
+        // Get viewport width for responsive scaling
+        const vw = window.innerWidth;
+        
+        // Calculate comfortable char count based on viewport
+        // Narrower viewports = fewer chars before scaling kicks in
+        // At 320px: ~8 chars comfortable
+        // At 480px: ~10 chars comfortable  
+        // At 768px: ~12 chars comfortable
+        // At 1200px+: ~14 chars comfortable
+        const COMFORTABLE_CHAR_COUNT = Math.min(14, Math.max(7, Math.floor(vw / 85)));
+        const MIN_SCALE = 0.35; // Don't go smaller than 35% of base size
+        
+        const charCount = word.length;
+        
+        if (charCount <= COMFORTABLE_CHAR_COUNT) return 1;
+        
+        // More aggressive scaling: each char over threshold reduces scale by 5.5%
+        const scale = 1 - ((charCount - COMFORTABLE_CHAR_COUNT) * 0.055);
+        
+        return Math.max(MIN_SCALE, scale);
+      };
+
+      // ============================================================
+      // Render a single word with ORP highlighting
+      // Used by renderWord for main word and context words
+      // ============================================================
+      const renderSingleWord = (word, options = {}) => {
+        const { 
+          isContext = false,      // Is this a context word (faded)?
+          fontScale = 1,          // Dynamic font scale for long words
+          contextScale = 0.4,     // Scale for context words relative to main
+        } = options;
+        
+        if (!word || word === PARAGRAPH_MARKER) {
+          // For paragraph markers in context, show nothing
+          if (isContext) return null;
+          // For main word, show subtle pilcrow
+          return React.createElement('span', {
+            style: {
+              opacity: 0.2,
+              fontSize: 'clamp(1.5rem, 8vw, 3rem)',
+            }
+          }, '¶');
+        }
+        
+        // Process word to separate punctuation
+        const { leadingPunct, coreWord, trailingPunct } = processWordForDisplay(word);
+        
+        // Calculate ORP position on the CORE word only
+        const orpPos = getORPPositionInWord(coreWord);
+        
+        // Calculate effective font scale (context words use smaller scale)
+        const effectiveScale = isContext ? contextScale : fontScale;
+        
+        // Base font size with dynamic scaling applied
+        const baseFontSize = `calc(clamp(2.5rem, 12vw, 4.5rem) * ${effectiveScale})`;
+        
+        // Style for dimmed punctuation
+        const punctOpacity = isContext ? 0.15 : 0.35;
+        const punctStyle = {
+          color: darkMode ? `rgba(255,255,255,${punctOpacity})` : `rgba(0,0,0,${punctOpacity})`,
+          fontWeight: '300',
+        };
+        
+        // Context words are more faded
+        const textOpacity = isContext ? 0.25 : 1;
+        const contextTextColor = darkMode 
+          ? `rgba(255,255,255,${textOpacity})` 
+          : `rgba(0,0,0,${textOpacity})`;
+        
+        return React.createElement('span', {
+          style: {
+            fontFamily: "'Montserrat', sans-serif",
+            fontSize: baseFontSize,
+            fontWeight: '400',
+            letterSpacing: '0.02em',
+            display: 'inline-flex',
+            alignItems: 'baseline',
+            justifyContent: 'center',
+            whiteSpace: 'nowrap',
+          }
+        }, [
+          // Leading punctuation (dimmed, slightly smaller)
+          leadingPunct && React.createElement('span', {
+            key: 'leading',
+            style: { ...punctStyle, fontSize: '0.75em', marginRight: '0.05em' }
+          }, leadingPunct),
+          
+          // Core word with ORP highlighting (only on main word, not context)
+          React.createElement('span', { key: 'core' }, 
+            coreWord.split('').map((char, idx) => 
+              React.createElement('span', {
+                key: idx,
+                style: {
+                  // ORP highlight only on main word, not context words
+                  color: (!isContext && idx === orpPos) 
+                    ? '#ef4444' 
+                    : contextTextColor,
+                  fontWeight: (!isContext && idx === orpPos) ? '500' : '400',
+                }
+              }, char)
+            )
+          ),
+          
+          // Trailing punctuation (dimmed, slightly smaller)
+          trailingPunct && React.createElement('span', {
+            key: 'trailing',
+            style: { ...punctStyle, fontSize: '0.85em', marginLeft: '0.02em' }
+          }, trailingPunct),
+        ]);
+      };
+
+      // ============================================================
+      // Word rendering with optional context preview
+      // Shows faded prev/next words when contextMode is enabled
       // ============================================================
       const renderWord = () => {
         const word = words[currentIndex] || '';
@@ -992,53 +1143,213 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
           }, '¶');
         }
         
-        // Process word to separate punctuation
-        const { leadingPunct, coreWord, trailingPunct } = processWordForDisplay(word);
+        // Calculate font scale for the main word
+        const fontScale = calculateFontScale(word);
         
-        // Calculate ORP position on the CORE word only
-        const orpPos = getORPPositionInWord(coreWord);
+        // If context mode is OFF, just render the single word
+        if (!contextMode) {
+          // Process word to separate punctuation
+          const { leadingPunct, coreWord, trailingPunct } = processWordForDisplay(word);
+          
+          // Calculate ORP position on the CORE word only
+          const orpPos = getORPPositionInWord(coreWord);
+          
+          // Apply dynamic font scaling
+          const scaledFontSize = `calc(clamp(2.5rem, 12vw, 4.5rem) * ${fontScale})`;
+          
+          // Style for dimmed punctuation
+          const punctStyle = {
+            color: darkMode ? 'rgba(255,255,255,0.35)' : 'rgba(0,0,0,0.35)',
+            fontWeight: '300',
+          };
+          
+          return React.createElement('span', {
+            style: {
+              fontFamily: "'Montserrat', sans-serif",
+              fontSize: scaledFontSize,
+              fontWeight: '400',
+              letterSpacing: '0.02em',
+              display: 'flex',
+              alignItems: 'baseline',
+              justifyContent: 'center',
+              maxWidth: '95vw',
+            }
+          }, [
+            // Leading punctuation (dimmed, slightly smaller)
+            leadingPunct && React.createElement('span', {
+              key: 'leading',
+              style: { ...punctStyle, fontSize: '0.75em', marginRight: '0.05em' }
+            }, leadingPunct),
+            
+            // Core word with ORP highlighting
+            React.createElement('span', { key: 'core' }, 
+              coreWord.split('').map((char, idx) => 
+                React.createElement('span', {
+                  key: idx,
+                  style: {
+                    color: idx === orpPos ? '#ef4444' : (darkMode ? '#ffffff' : '#1a1a1a'),
+                    fontWeight: idx === orpPos ? '500' : '400',
+                  }
+                }, char)
+              )
+            ),
+            
+            // Trailing punctuation (dimmed, slightly smaller)
+            trailingPunct && React.createElement('span', {
+              key: 'trailing',
+              style: { ...punctStyle, fontSize: '0.85em', marginLeft: '0.02em' }
+            }, trailingPunct),
+          ]);
+        }
         
-        // Style for dimmed punctuation
-        const punctStyle = {
-          color: darkMode ? 'rgba(255,255,255,0.35)' : 'rgba(0,0,0,0.35)',
-          fontWeight: '300',
-        };
+        // ============================================================
+        // CONTEXT MODE: Show prev word | MAIN WORD | next word
+        // ============================================================
         
-        return React.createElement('span', {
+        // Get previous and next words, skipping paragraph markers
+        let prevWord = null;
+        let nextWord = null;
+        
+        // Find previous displayable word
+        for (let i = currentIndex - 1; i >= 0; i--) {
+          if (words[i] !== PARAGRAPH_MARKER) {
+            prevWord = words[i];
+            break;
+          }
+        }
+        
+        // Find next displayable word
+        for (let i = currentIndex + 1; i < words.length; i++) {
+          if (words[i] !== PARAGRAPH_MARKER) {
+            nextWord = words[i];
+            break;
+          }
+        }
+        
+        // Calculate scales for context words (they also get dynamic scaling)
+        const prevScale = prevWord ? calculateFontScale(prevWord) : 1;
+        const nextScale = nextWord ? calculateFontScale(nextWord) : 1;
+        
+        // Context scale - slightly larger on mobile vertical layout for readability
+        const contextScale = isMobileView ? 0.42 : 0.38;
+        
+        // ============================================================
+        // MOBILE: Vertical stack layout (prev above, main center, next below)
+        // ============================================================
+        if (isMobileView) {
+          return React.createElement('div', {
+            style: {
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: 'clamp(0.25rem, 2vh, 0.75rem)',
+              width: '100%',
+              maxWidth: '95vw',
+              overflow: 'visible',
+              padding: '0 0.5rem',
+            }
+          }, [
+            // Previous word (faded, smaller, above)
+            React.createElement('div', {
+              key: 'prev',
+              style: {
+                height: 'clamp(1.5rem, 6vh, 2.5rem)',
+                display: 'flex',
+                alignItems: 'flex-end',
+                justifyContent: 'center',
+                maxWidth: '90vw',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+              }
+            }, prevWord 
+              ? renderSingleWord(prevWord, { isContext: true, fontScale: prevScale, contextScale })
+              : React.createElement('span', { style: { opacity: 0 } }, '—')
+            ),
+            
+            // Main word (full size, centered, with ORP)
+            React.createElement('div', {
+              key: 'main',
+              style: {
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                maxWidth: '95vw',
+                overflow: 'visible',
+              }
+            }, renderSingleWord(word, { isContext: false, fontScale })),
+            
+            // Next word (faded, smaller, below)
+            React.createElement('div', {
+              key: 'next',
+              style: {
+                height: 'clamp(1.5rem, 6vh, 2.5rem)',
+                display: 'flex',
+                alignItems: 'flex-start',
+                justifyContent: 'center',
+                maxWidth: '90vw',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+              }
+            }, nextWord 
+              ? renderSingleWord(nextWord, { isContext: true, fontScale: nextScale, contextScale })
+              : React.createElement('span', { style: { opacity: 0 } }, '—')
+            ),
+          ]);
+        }
+        
+        // ============================================================
+        // DESKTOP: Horizontal layout (prev | MAIN | next)
+        // ============================================================
+        return React.createElement('div', {
           style: {
-            fontFamily: "'Montserrat', sans-serif",
-            fontSize: 'clamp(2.5rem, 12vw, 4.5rem)',
-            fontWeight: '400',
-            letterSpacing: '0.02em',
             display: 'flex',
             alignItems: 'baseline',
             justifyContent: 'center',
+            gap: 'clamp(0.75rem, 3vw, 2rem)',
+            width: '100%',
+            maxWidth: '95vw',
+            overflow: 'visible',
+            padding: '0 0.5rem',
           }
         }, [
-          // Leading punctuation (dimmed, slightly smaller)
-          leadingPunct && React.createElement('span', {
-            key: 'leading',
-            style: { ...punctStyle, fontSize: '0.75em', marginRight: '0.05em' }
-          }, leadingPunct),
-          
-          // Core word with ORP highlighting
-          React.createElement('span', { key: 'core' }, 
-            coreWord.split('').map((char, idx) => 
-              React.createElement('span', {
-                key: idx,
-                style: {
-                  color: idx === orpPos ? '#ef4444' : (darkMode ? '#ffffff' : '#1a1a1a'),
-                  fontWeight: idx === orpPos ? '500' : '400',
-                }
-              }, char)
-            )
+          // Previous word (faded, smaller)
+          React.createElement('span', {
+            key: 'prev',
+            style: {
+              flex: '0 1 auto',
+              maxWidth: '22%',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+            }
+          }, prevWord 
+            ? renderSingleWord(prevWord, { isContext: true, fontScale: prevScale, contextScale })
+            : React.createElement('span', { style: { opacity: 0 } }, '—')
           ),
           
-          // Trailing punctuation (dimmed, slightly smaller)
-          trailingPunct && React.createElement('span', {
-            key: 'trailing',
-            style: { ...punctStyle, fontSize: '0.85em', marginLeft: '0.02em' }
-          }, trailingPunct),
+          // Main word (full size, centered, with ORP)
+          React.createElement('span', {
+            key: 'main',
+            style: {
+              flex: '0 1 auto',
+              maxWidth: '50%',
+              overflow: 'visible',
+            }
+          }, renderSingleWord(word, { isContext: false, fontScale })),
+          
+          // Next word (faded, smaller)
+          React.createElement('span', {
+            key: 'next',
+            style: {
+              flex: '0 1 auto',
+              maxWidth: '22%',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+            }
+          }, nextWord 
+            ? renderSingleWord(nextWord, { isContext: true, fontScale: nextScale, contextScale })
+            : React.createElement('span', { style: { opacity: 0 } }, '—')
+          ),
         ]);
       };
 
@@ -1405,7 +1716,7 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
             zIndex: focusMode ? 200 : 'auto',
             backgroundColor: focusMode ? (darkMode ? '#000000' : '#ffffff') : 'transparent',
             cursor: 'pointer',
-            overflow: 'hidden',
+            overflow: 'visible',
           }
         }, [
           // Dialogue indicator (hidden in focus mode)
@@ -1574,9 +1885,15 @@ Adjust your reading speed with the WPM slider. Most people start around 300 word
             React.createElement('button', {
               key: 'focus',
               onClick: () => setFocusMode(true),
-              title: 'Focus mode',
+              title: 'Focus mode (F)',
               style: { ...buttonStyle, padding: '8px 12px', fontSize: '14px', minWidth: '42px' }
             }, '⛶'),
+            React.createElement('button', {
+              key: 'context',
+              onClick: () => setContextMode(!contextMode),
+              title: 'Context preview (C)',
+              style: { ...buttonStyle, padding: '8px 12px', fontSize: '14px', minWidth: '42px', opacity: contextMode ? 1 : 0.5 }
+            }, '👁'),
           ]),
         ])),
 
