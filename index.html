@@ -1121,6 +1121,17 @@
         this._playedDuration = 0;
         this._currentBufferStart = 0;
         this._generationComplete = false; // true when all chunks have been enqueued
+        this._estimatedTotalDuration = 0; // estimated from text length, set before generation starts
+      }
+      
+      /**
+       * Set an estimated total duration based on text length.
+       * Used for stable progress tracking during streaming generation.
+       * Average English speech: ~150 wpm at 1.0x speed.
+       */
+      setEstimatedDuration(text, speed) {
+        const wordCount = text.split(/\s+/).length;
+        this._estimatedTotalDuration = (wordCount / 150) * 60 / (speed || 1.0);
       }
       
       async init(onProgress) {
@@ -1289,6 +1300,7 @@
         this._currentBufferStart = 0;
         this._isQueuePlaying = false;
         this._generationComplete = false;
+        this._estimatedTotalDuration = 0;
         this._onQueueDrained = null;
         this.stop();
       }
@@ -1302,7 +1314,10 @@
       async streamParagraph(voiceSegments, speed, onFirstChunk, onAllPlayed, cancelRef) {
         this.clearQueue();
         this._onQueueDrained = onAllPlayed;
-        // generationComplete starts false (set by clearQueue), set true when all chunks enqueued
+        
+        // Estimate total audio duration from text length for stable progress tracking
+        const fullText = voiceSegments.map(s => s.text).join(' ');
+        this.setEstimatedDuration(fullText, speed);
         
         let firstChunkSent = false;
         let chunkCount = 0;
@@ -1370,16 +1385,23 @@
       }
       
       /**
-       * Progress across the entire paragraph (all queued + playing chunks).
-       * Returns 0-1 based on played duration vs total duration.
+       * Progress across the entire paragraph.
+       * Uses estimated duration during streaming (stable denominator).
+       * Switches to actual total duration once all chunks are generated.
        */
       getProgress() {
-        if (this._totalQueueDuration <= 0) return 0;
+        // Use actual total once generation is complete, estimated during streaming
+        const totalDuration = this._generationComplete
+          ? this._totalQueueDuration
+          : this._estimatedTotalDuration;
+        
+        if (totalDuration <= 0) return 0;
+        
         let currentElapsed = 0;
         if (this.currentSource && this._currentBufferStart) {
           currentElapsed = this.audioContext.currentTime - this._currentBufferStart;
         }
-        return Math.min(1, (this._playedDuration + currentElapsed) / this._totalQueueDuration);
+        return Math.min(1, (this._playedDuration + currentElapsed) / totalDuration);
       }
       
       setVolume(vol) {
