@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <meta name="theme-color" content="#0a0a0a">
-  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="description" content="RSVP Speed Reader & AI Voice Reader for EPUB books">
   
@@ -1057,15 +1057,16 @@
         if (this.onStatusChange) this.onStatusChange('loading', 0);
         
         try {
-          // Dynamic import of transformers.js — only loaded when user activates listen mode
-          const transformers = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3');
-          const KokoroTTS = transformers.KokoroTTS;
+          // Dynamic import of kokoro-js — the dedicated Kokoro TTS library
+          // Built on top of transformers.js but exposes the KokoroTTS class directly
+          const kokoroModule = await import('https://cdn.jsdelivr.net/npm/kokoro-js@1/+esm');
+          const KokoroTTS = kokoroModule.KokoroTTS;
           
           if (!KokoroTTS) {
-            throw new Error('KokoroTTS not found in transformers.js');
+            throw new Error('KokoroTTS not found in kokoro-js');
           }
           
-          // Detect best device
+          // Detect best device for inference
           let device = 'wasm';
           let dtype = 'q8';
           try {
@@ -1082,6 +1083,7 @@
           
           console.log('Loading Kokoro TTS with device=' + device + ', dtype=' + dtype);
           
+          // from_pretrained downloads and caches the model in IndexedDB
           this.tts = await KokoroTTS.from_pretrained(
             'onnx-community/Kokoro-82M-v1.0-ONNX',
             {
@@ -1097,7 +1099,7 @@
             }
           );
           
-          // Create audio context
+          // Create audio context for playback
           this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
           this.gainNode = this.audioContext.createGain();
           this.gainNode.connect(this.audioContext.destination);
@@ -1119,13 +1121,29 @@
         const v = voice || 'af_heart';
         const s = speed || 1.0;
         
+        // kokoro-js generate() returns an audio object
+        // It has .audio (Float32Array), .sampling_rate, and .save() / .toWav()
         const result = await this.tts.generate(text, { voice: v, speed: s });
         
-        // Convert Float32Array to AudioBuffer
-        const buffer = this.audioContext.createBuffer(
-          1, result.audio.length, result.sampling_rate
-        );
-        buffer.copyToChannel(result.audio, 0);
+        // Extract raw audio data — handle both possible API shapes
+        const audioData = result.audio || result;
+        const sampleRate = result.sampling_rate || 24000;
+        
+        // Convert to Web Audio API AudioBuffer for playback
+        let float32;
+        if (audioData instanceof Float32Array) {
+          float32 = audioData;
+        } else if (audioData.data) {
+          // Tensor-like object
+          float32 = new Float32Array(audioData.data);
+        } else if (ArrayBuffer.isView(audioData)) {
+          float32 = new Float32Array(audioData.buffer);
+        } else {
+          throw new Error('Unexpected audio format from Kokoro');
+        }
+        
+        const buffer = this.audioContext.createBuffer(1, float32.length, sampleRate);
+        buffer.copyToChannel(float32, 0);
         return buffer;
       }
       
