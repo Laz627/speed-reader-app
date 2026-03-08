@@ -1136,20 +1136,21 @@
           
           if (!KokoroTTS) throw new Error('KokoroTTS not found in kokoro-js');
           
-          // Default to q8 for fast inference on all devices.
-          // q8 is ~80MB vs fp32's ~326MB, with negligible quality difference.
-          // Still use WebGPU for device if available (accelerates q8 too).
+          // Use fp32 with WebGPU (GPU excels at float ops, q8 produces garbled output on GPU).
+          // Use q8 with WASM fallback (smaller download, fast enough on CPU).
           let device = 'wasm';
+          let dtype = 'q8';
           try {
             if (navigator.gpu) {
               const adapter = await navigator.gpu.requestAdapter();
-              if (adapter) device = 'webgpu';
+              if (adapter) {
+                device = 'webgpu';
+                dtype = 'fp32';
+              }
             }
           } catch(e) {
-            console.log('WebGPU detection failed, using WASM');
+            console.log('WebGPU detection failed, using WASM/q8');
           }
-          
-          const dtype = 'q8';
           this._currentDevice = device;
           console.log('[TTS] Loading Kokoro with device=' + device + ', dtype=' + dtype);
           
@@ -1174,7 +1175,7 @@
           
           this.status = 'ready';
           if (this.onStatusChange) this.onStatusChange('ready', 100);
-          console.log('[TTS] Kokoro loaded successfully (' + device + '/q8)');
+          console.log('[TTS] Kokoro loaded successfully (' + device + '/' + dtype + ')');
           
         } catch (err) {
           console.error('[TTS] Init failed:', err);
