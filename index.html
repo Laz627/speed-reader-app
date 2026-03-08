@@ -1194,7 +1194,12 @@
       getProgress() {
         if (!this.currentSource || !this.playStartTime || !this.playDuration) return 0;
         const elapsed = this.audioContext.currentTime - this.playStartTime;
-        return Math.min(1, elapsed / this.playDuration);
+        const linear = Math.min(1, elapsed / this.playDuration);
+        // Apply a slight deceleration curve — speech tends to be front-loaded in pace,
+        // so linear time tracking runs ahead of actual spoken word position.
+        // pow(x, 1.15) slows the visual progress slightly to better match speech.
+        // Cap at 0.95 during playback — only hit 1.0 when onended fires.
+        return Math.min(0.95, Math.pow(linear, 1.15));
       }
       
       setVolume(vol) {
@@ -1443,8 +1448,16 @@
       // Enhanced: builds paragraphRanges, splits hyphens, builds metadata
       // ============================================================
       useEffect(() => {
-        const text = book ? book.chapters[chapterIndex]?.text : demoText;
+        let text = book ? book.chapters[chapterIndex]?.text : demoText;
         if (!text) return;
+        
+        // Step 0: Ensure paragraph markers exist for ALL text sources
+        // extractTextFromHTML() adds them for EPUB content, but raw text
+        // (demo, pasted) uses \n\n which needs the same treatment
+        if (!text.includes(PARAGRAPH_MARKER)) {
+          text = text.replace(/\n\s*\n\s*/g, ' ' + PARAGRAPH_MARKER + ' ');
+          text = text.replace(/\n/g, ' ');
+        }
         
         // Step 1: Split into raw tokens
         let tokens = text.trim().split(/\s+/).filter(w => w.length > 0);
@@ -1788,6 +1801,9 @@
         if (paragraphRanges.length === 0) return;
         
         let cancelled = false;
+        
+        // Reset progress tracking for the new paragraph
+        setListenAudioProgress(0);
         
         async function playCurrentParagraph() {
           const para = paragraphRanges[listenParagraphIdx];
