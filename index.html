@@ -796,6 +796,75 @@
     }
 
     // ============================================================
+    // PARAGRAPH VOICE SPLITTING
+    // Splits paragraph text into segments tagged as narration or dialogue.
+    // "He paused. "I don't think so," he said."
+    //   → [{text: "He paused.", voice: 'narration'},
+    //      {text: "I don't think so,", voice: 'dialogue'},
+    //      {text: "he said.", voice: 'narration'}]
+    // ============================================================
+    
+    function splitParagraphForVoices(text) {
+      const segments = [];
+      let current = '';
+      let inQuote = false;
+      
+      // Walk character by character tracking quote state
+      for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        
+        // Detect opening quote
+        if (!inQuote && (ch === '"' || ch === '\u201C' || ch === '\u00AB')) {
+          // Push any accumulated narration
+          if (current.trim()) {
+            segments.push({ text: current.trim(), voice: 'narration' });
+          }
+          current = ch;
+          inQuote = true;
+          continue;
+        }
+        
+        // Detect closing quote
+        if (inQuote && (ch === '"' || ch === '\u201D' || ch === '\u00BB')) {
+          current += ch;
+          // Push the dialogue segment (including quotes for natural TTS intonation)
+          if (current.trim()) {
+            segments.push({ text: current.trim(), voice: 'dialogue' });
+          }
+          current = '';
+          inQuote = false;
+          continue;
+        }
+        
+        current += ch;
+      }
+      
+      // Push any remaining text
+      if (current.trim()) {
+        segments.push({ text: current.trim(), voice: inQuote ? 'dialogue' : 'narration' });
+      }
+      
+      // If no dialogue was found, return single narration segment
+      if (segments.length === 0) {
+        return [{ text: text, voice: 'narration' }];
+      }
+      
+      // Merge adjacent segments of the same voice type (e.g. two narration pieces)
+      const merged = [segments[0]];
+      for (let i = 1; i < segments.length; i++) {
+        const last = merged[merged.length - 1];
+        if (segments[i].voice === last.voice) {
+          last.text += ' ' + segments[i].text;
+        } else {
+          merged.push(segments[i]);
+        }
+      }
+      
+      // Filter out segments that are too short to generate audio (just punctuation etc)
+      return merged.filter(s => s.text.replace(/[^a-zA-Z]/g, '').length > 0);
+    }
+
+    // ============================================================
     // EPUB PARSER (Enhanced with paragraph structure)
     // ============================================================
 
@@ -1046,6 +1115,8 @@
         this.onProgressChange = null;
         this.onPlaybackEnd = null;
         this.gainNode = null;
+        this._currentDevice = 'wasm';
+        this._wasmFallbackAttempted = false;
       }
       
       async init(onProgress) {
@@ -1121,10 +1192,44 @@
         const v = voice || 'af_heart';
         const s = speed || 1.0;
         
-        // kokoro-js generate() returns an audio object
-        // It has .audio (Float32Array), .sampling_rate, and .save() / .toWav()
-        const result = await this.tts.generate(text, { voice: v, speed: s });
-        
+        try {
+          // kokoro-js generate() returns an audio object
+          // It has .audio (Float32Array), .sampling_rate, and .save() / .toWav()
+          const result = await this.tts.generate(text, { voice: v, speed: s });
+          return this._resultToBuffer(result);
+          
+        } catch (err) {
+          console.warn('TTS generate failed:', err.message);
+          
+          // If WebGPU failed, attempt to reload model with WASM fallback
+          if (this._currentDevice === 'webgpu' && !this._wasmFallbackAttempted) {
+            console.log('Attempting WASM fallback...');
+            this._wasmFallbackAttempted = true;
+            
+            try {
+              const kokoroModule = await import('https://cdn.jsdelivr.net/npm/kokoro-js@1/+esm');
+              const KokoroTTS = kokoroModule.KokoroTTS;
+              
+              this.tts = await KokoroTTS.from_pretrained(
+                'onnx-community/Kokoro-82M-v1.0-ONNX',
+                { dtype: 'q8', device: 'wasm' }
+              );
+              this._currentDevice = 'wasm';
+              console.log('WASM fallback loaded successfully');
+              
+              const result = await this.tts.generate(text, { voice: v, speed: s });
+              return this._resultToBuffer(result);
+            } catch (fallbackErr) {
+              console.error('WASM fallback also failed:', fallbackErr);
+              throw fallbackErr;
+            }
+          }
+          
+          throw err;
+        }
+      }
+      
+      _resultToBuffer(result) {
         // Extract raw audio data — handle both possible API shapes
         const audioData = result.audio || result;
         const sampleRate = result.sampling_rate || 24000;
@@ -1147,12 +1252,13 @@
         return buffer;
       }
       
-      play(buffer, onEnded) {
+      async play(buffer, onEnded) {
         this.stop();
         
-        // Resume audio context if suspended (mobile browsers require user gesture)
+        // MUST await resume before starting — otherwise playStartTime is captured
+        // before the context clock actually starts ticking, causing progress to run ahead
         if (this.audioContext.state === 'suspended') {
-          this.audioContext.resume();
+          await this.audioContext.resume();
         }
         
         const source = this.audioContext.createBufferSource();
@@ -1160,12 +1266,15 @@
         source.connect(this.gainNode);
         source.onended = () => {
           this.currentSource = null;
+          this.playDuration = 0; // signal completion
           if (onEnded) onEnded();
         };
         source.start();
         this.currentSource = source;
+        // Capture time AFTER resume and start — this is the true reference point
         this.playStartTime = this.audioContext.currentTime;
         this.playDuration = buffer.duration;
+        console.log('[TTS] Playing buffer: ' + buffer.duration.toFixed(1) + 's, ' + buffer.length + ' samples');
       }
       
       stop() {
@@ -1194,16 +1303,33 @@
       getProgress() {
         if (!this.currentSource || !this.playStartTime || !this.playDuration) return 0;
         const elapsed = this.audioContext.currentTime - this.playStartTime;
-        const linear = Math.min(1, elapsed / this.playDuration);
-        // Apply a slight deceleration curve — speech tends to be front-loaded in pace,
-        // so linear time tracking runs ahead of actual spoken word position.
-        // pow(x, 1.15) slows the visual progress slightly to better match speech.
-        // Cap at 0.95 during playback — only hit 1.0 when onended fires.
-        return Math.min(0.95, Math.pow(linear, 1.15));
+        return Math.min(1, elapsed / this.playDuration);
       }
       
       setVolume(vol) {
         if (this.gainNode) this.gainNode.gain.value = Math.max(0, Math.min(1, vol));
+      }
+      
+      /**
+       * Concatenates multiple AudioBuffers into one continuous buffer.
+       * Used to stitch narration + dialogue segments into seamless playback.
+       */
+      concatBuffers(buffers) {
+        if (buffers.length === 0) return null;
+        if (buffers.length === 1) return buffers[0];
+        
+        const sampleRate = buffers[0].sampleRate;
+        const totalLength = buffers.reduce((sum, b) => sum + b.length, 0);
+        const result = this.audioContext.createBuffer(1, totalLength, sampleRate);
+        const channel = result.getChannelData(0);
+        
+        let offset = 0;
+        for (const buf of buffers) {
+          channel.set(buf.getChannelData(0), offset);
+          offset += buf.length;
+        }
+        
+        return result;
       }
       
       destroy() {
@@ -1349,6 +1475,7 @@
       const [isListenPlaying, setIsListenPlaying] = useState(false);
       const [listenSpeed, setListenSpeed] = useState(savedPrefs.current.listenSpeed || 1.0);
       const [selectedVoice, setSelectedVoice] = useState(savedPrefs.current.voice || 'af_heart');
+      const [dialogueVoice, setDialogueVoice] = useState(savedPrefs.current.dialogueVoice || 'af_bella');
       const [modelStatus, setModelStatus] = useState('idle');
       const [modelLoadProgress, setModelLoadProgress] = useState(0);
       const [listenAudioProgress, setListenAudioProgress] = useState(0);
@@ -1439,9 +1566,10 @@
           wakeLock: wakeLockEnabled, smartPacing: smartPacingEnabled,
           paragraphPause: paragraphPauseMs,
           wpm, context: contextMode, voice: selectedVoice,
+          dialogueVoice: dialogueVoice,
           listenSpeed, onboarded: true,
         });
-      }, [themeMode, pausesEnabled, hapticEnabled, wakeLockEnabled, smartPacingEnabled, paragraphPauseMs, wpm, contextMode, selectedVoice, listenSpeed]);
+      }, [themeMode, pausesEnabled, hapticEnabled, wakeLockEnabled, smartPacingEnabled, paragraphPauseMs, wpm, contextMode, selectedVoice, dialogueVoice, listenSpeed]);
 
       // ============================================================
       // PARSE CHAPTER TEXT INTO WORDS
@@ -1812,15 +1940,42 @@
           setIsGenerating(true);
           
           try {
-            // Generate audio for current paragraph
-            const buffer = await kokoroManager.generateAudio(para.text, selectedVoice, listenSpeed);
+            // Split paragraph into narration/dialogue segments
+            const segments = splitParagraphForVoices(para.text);
+            const hasDialogue = segments.some(s => s.voice === 'dialogue');
+            
+            console.log('[TTS] Para ' + (listenParagraphIdx + 1) + '/' + paragraphRanges.length
+              + ' → ' + segments.length + ' segment(s)'
+              + (hasDialogue ? ' (with dialogue)' : '')
+              + ': "' + para.text.substring(0, 60) + '..."');
+            
+            // Generate audio for each segment with the appropriate voice
+            const audioBuffers = [];
+            for (const seg of segments) {
+              if (cancelled) return;
+              const voice = seg.voice === 'dialogue' ? dialogueVoice : selectedVoice;
+              console.log('[TTS]   ' + seg.voice + ' (' + voice + '): "' + seg.text.substring(0, 50) + '..."');
+              const buf = await kokoroManager.generateAudio(seg.text, voice, listenSpeed);
+              audioBuffers.push(buf);
+            }
             if (cancelled) return;
+            
+            // Concatenate all segment buffers into one continuous buffer
+            const buffer = audioBuffers.length === 1
+              ? audioBuffers[0]
+              : kokoroManager.concatBuffers(audioBuffers);
+            
+            if (!buffer) {
+              console.warn('[TTS] No audio generated for paragraph');
+              setIsGenerating(false);
+              return;
+            }
             
             setIsGenerating(false);
             currentAudioBufferRef.current = buffer;
             
-            // Play it
-            kokoroManager.play(buffer, () => {
+            // Play it — must await since play() now handles async resume
+            await kokoroManager.play(buffer, () => {
               if (cancelled) return;
               // Auto-advance to next paragraph
               setListenParagraphIdx(prev => {
@@ -1843,16 +1998,26 @@
               });
             });
             
-            // Start pre-generating next paragraph
+            // Start pre-generating next paragraph (with voice splitting)
             const nextPara = paragraphRanges[listenParagraphIdx + 1];
             if (nextPara && !cancelled) {
-              kokoroManager.generateAudio(nextPara.text, selectedVoice, listenSpeed)
-                .then(buf => {
+              (async () => {
+                try {
+                  const nextSegments = splitParagraphForVoices(nextPara.text);
+                  const nextBuffers = [];
+                  for (const seg of nextSegments) {
+                    if (cancelled) return;
+                    const voice = seg.voice === 'dialogue' ? dialogueVoice : selectedVoice;
+                    nextBuffers.push(await kokoroManager.generateAudio(seg.text, voice, listenSpeed));
+                  }
                   if (!cancelled) {
-                    kokoroManager.nextBuffer = buf;
+                    kokoroManager.nextBuffer = nextBuffers.length === 1
+                      ? nextBuffers[0]
+                      : kokoroManager.concatBuffers(nextBuffers);
                     kokoroManager.nextBufferParagraphIdx = listenParagraphIdx + 1;
                   }
-                }).catch(() => {});
+                } catch(e) { /* pre-gen failure is non-critical */ }
+              })();
             }
             
             // Update media session
@@ -1878,7 +2043,7 @@
           cancelled = true;
           kokoroManager.stop();
         };
-      }, [mode, isListenPlaying, listenParagraphIdx, modelStatus, paragraphRanges, selectedVoice, listenSpeed, book, chapterIndex, triggerChapterSplash]);
+      }, [mode, isListenPlaying, listenParagraphIdx, modelStatus, paragraphRanges, selectedVoice, dialogueVoice, listenSpeed, book, chapterIndex, triggerChapterSplash]);
       
       // Track audio progress for paragraph highlight
       useEffect(() => {
@@ -2560,9 +2725,9 @@
             
             // Voice settings
             e('div', { key: 'voice', className: 'settings-section' }, [
-              e('div', { key: 'l', className: 'settings-label' }, 'Voice (Listen Mode)'),
-              e('div', { key: 'r', className: 'settings-row' }, [
-                e('span', { key: 'rl', className: 'settings-row-label' }, 'Voice'),
+              e('div', { key: 'l', className: 'settings-label' }, 'Voices (Listen Mode)'),
+              e('div', { key: 'narrator', className: 'settings-row' }, [
+                e('span', { key: 'rl', className: 'settings-row-label' }, 'Narrator'),
                 e('select', {
                   key: 'sel',
                   className: 'settings-select',
@@ -2572,6 +2737,19 @@
                   e('option', { key: v.id, value: v.id }, v.name + ' (' + v.rating + ') ' + (v.gender === 'F' ? '\u2640' : '\u2642'))
                 )),
               ]),
+              e('div', { key: 'dialogue', className: 'settings-row' }, [
+                e('span', { key: 'rl', className: 'settings-row-label' }, 'Dialogue'),
+                e('select', {
+                  key: 'sel',
+                  className: 'settings-select',
+                  value: dialogueVoice,
+                  onChange: (ev) => setDialogueVoice(ev.target.value),
+                }, KOKORO_VOICES.map(v =>
+                  e('option', { key: v.id, value: v.id }, v.name + ' (' + v.rating + ') ' + (v.gender === 'F' ? '\u2640' : '\u2642'))
+                )),
+              ]),
+              e('div', { key: 'voicenote', style: { fontSize: '0.6875rem', color: theme.muted, marginTop: '0.25rem' } },
+                'Narrator reads prose; Dialogue reads quoted text'),
               e('div', { key: 'speed', className: 'settings-row' }, [
                 e('span', { key: 'sl', className: 'settings-row-label' }, 'Listen Speed: ' + listenSpeed.toFixed(1) + 'x'),
                 e('input', {
