@@ -1120,6 +1120,7 @@
         this._totalQueueDuration = 0;
         this._playedDuration = 0;
         this._currentBufferStart = 0;
+        this._generationComplete = false; // true when all chunks have been enqueued
       }
       
       async init(onProgress) {
@@ -1241,12 +1242,19 @@
       
       /**
        * Play the next buffer in the queue.
+       * Only fires onQueueDrained when queue is empty AND all generation is done.
        */
       async _playNext() {
         if (this._queue.length === 0) {
           this._isQueuePlaying = false;
-          console.log('[TTS] Queue drained. Total duration: ' + this._totalQueueDuration.toFixed(1) + 's');
-          if (this._onQueueDrained) this._onQueueDrained();
+          
+          // Only signal completion if all chunks have been generated
+          if (this._generationComplete) {
+            console.log('[TTS] Queue drained. Total duration: ' + this._totalQueueDuration.toFixed(1) + 's');
+            if (this._onQueueDrained) this._onQueueDrained();
+          }
+          // Otherwise, generation is still in progress — _playNext will be
+          // called again when the next chunk arrives via enqueue()
           return;
         }
         
@@ -1280,6 +1288,7 @@
         this._playedDuration = 0;
         this._currentBufferStart = 0;
         this._isQueuePlaying = false;
+        this._generationComplete = false;
         this._onQueueDrained = null;
         this.stop();
       }
@@ -1293,6 +1302,7 @@
       async streamParagraph(voiceSegments, speed, onFirstChunk, onAllPlayed, cancelRef) {
         this.clearQueue();
         this._onQueueDrained = onAllPlayed;
+        // generationComplete starts false (set by clearQueue), set true when all chunks enqueued
         
         let firstChunkSent = false;
         let chunkCount = 0;
@@ -1324,7 +1334,16 @@
           }
         }
         
+        // All chunks have been generated and enqueued
+        this._generationComplete = true;
         console.log('[TTS] All ' + chunkCount + ' chunks generated for paragraph');
+        
+        // If the queue already drained while we were generating the last chunk
+        // (i.e. playback finished before generation finished), fire the callback now
+        if (!this._isQueuePlaying && this._queue.length === 0) {
+          console.log('[TTS] Queue already drained, firing onAllPlayed now');
+          if (this._onQueueDrained) this._onQueueDrained();
+        }
       }
       
       stop() {
