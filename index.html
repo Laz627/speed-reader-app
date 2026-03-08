@@ -1325,20 +1325,20 @@
         for (const seg of voiceSegments) {
           if (cancelRef && cancelRef.cancelled) return;
           
-          // Split segment into sentences for fine-grained streaming
-          const sentences = splitIntoSentences(seg.text);
+          // Split segment into chunks for streaming (2-3 sentences per chunk)
+          const chunks = splitIntoChunks(seg.text);
           
-          for (const sentence of sentences) {
+          for (const chunk of chunks) {
             if (cancelRef && cancelRef.cancelled) return;
-            if (sentence.trim().length < 2) continue; // skip empty
+            if (chunk.trim().length < 2) continue; // skip empty
             
             const t0 = performance.now();
-            const buffer = await this.generateChunk(sentence.trim(), seg.voice, speed);
+            const buffer = await this.generateChunk(chunk.trim(), seg.voice, speed);
             const genTime = ((performance.now() - t0) / 1000).toFixed(1);
             chunkCount++;
             console.log('[TTS] Chunk ' + chunkCount + ' (' + seg.voiceType + '): '
               + genTime + 's gen → ' + buffer.duration.toFixed(1) + 's audio'
-              + ' | "' + sentence.trim().substring(0, 40) + '..."');
+              + ' | "' + chunk.trim().substring(0, 40) + '..."');
             
             this.enqueue(buffer);
             
@@ -1420,27 +1420,40 @@
     }
     
     /**
-     * Split text into sentences for streaming generation.
-     * Keeps punctuation with the sentence. Handles common abbreviations.
+     * Split text into chunks for streaming generation.
+     * Targets ~30-60 words per chunk (10-20s of audio) to minimize
+     * per-call overhead while keeping time-to-first-audio reasonable.
+     * Single-sentence paragraphs stay as one chunk.
      */
-    function splitIntoSentences(text) {
-      // Match sentences ending with . ! ? (optionally followed by closing quotes)
-      // Then any trailing whitespace
+    function splitIntoChunks(text) {
+      // First split into sentences
       const raw = text.match(/[^.!?]*[.!?]+["'"'\u201D\u2019]?\s*/g);
-      if (!raw || raw.length === 0) return [text];
+      if (!raw || raw.length <= 1) return [text]; // single sentence or no splits
       
-      // Rejoin very short fragments (< 20 chars) with the previous sentence
-      // to avoid sending tiny chunks to Kokoro (bad quality on < 5 words)
-      const merged = [];
-      for (const s of raw) {
-        if (merged.length > 0 && s.trim().length < 20) {
-          merged[merged.length - 1] += s;
+      // Merge sentences into chunks targeting ~40 words each
+      const TARGET_WORDS = 40;
+      const chunks = [];
+      let current = '';
+      let currentWords = 0;
+      
+      for (const sentence of raw) {
+        const sentenceWords = sentence.trim().split(/\s+/).length;
+        
+        // If adding this sentence would exceed target and we already have content, start new chunk
+        if (currentWords > 0 && currentWords + sentenceWords > TARGET_WORDS) {
+          chunks.push(current.trim());
+          current = sentence;
+          currentWords = sentenceWords;
         } else {
-          merged.push(s);
+          current += sentence;
+          currentWords += sentenceWords;
         }
       }
       
-      return merged.filter(s => s.trim().length > 0);
+      // Push remaining
+      if (current.trim()) chunks.push(current.trim());
+      
+      return chunks.filter(c => c.length > 0);
     }
     
     // Singleton instance
