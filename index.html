@@ -1112,26 +1112,14 @@
         this.gainNode = null;
         this._currentDevice = 'wasm';
         
-        // Queue-based streaming playback
-        // Sentences are generated one at a time and queued for seamless chaining
-        this._queue = [];           // AudioBuffer[]
-        this._isQueuePlaying = false;
-        this._onQueueDrained = null; // callback when all queued audio has played
-        this._totalQueueDuration = 0;
-        this._playedDuration = 0;
-        this._currentBufferStart = 0;
-        this._generationComplete = false; // true when all chunks have been enqueued
-        this._estimatedTotalDuration = 0; // estimated from text length, set before generation starts
-      }
-      
-      /**
-       * Set an estimated total duration based on text length.
-       * Used for stable progress tracking during streaming generation.
-       * Average English speech: ~150 wpm at 1.0x speed.
-       */
-      setEstimatedDuration(text, speed) {
-        const wordCount = text.split(/\s+/).length;
-        this._estimatedTotalDuration = (wordCount / 150) * 60 / (speed || 1.0);
+        // Simple playback tracking
+        this._playStartTime = 0;
+        this._playDuration = 0;
+        
+        // Pre-generation cache: stores the next paragraph's audio
+        this._pregenBuffer = null;
+        this._pregenKey = null; // string key to identify what was pre-generated
+        this._pregenPromise = null; // in-flight pre-generation promise
       }
       
       async init(onProgress) {
@@ -1145,32 +1133,26 @@
         try {
           const kokoroModule = await import('https://cdn.jsdelivr.net/npm/kokoro-js@1/+esm');
           const KokoroTTS = kokoroModule.KokoroTTS;
-          
           if (!KokoroTTS) throw new Error('KokoroTTS not found in kokoro-js');
           
-          // Use fp32 with WebGPU (GPU excels at float ops, q8 produces garbled output on GPU).
-          // Use q8 with WASM fallback (smaller download, fast enough on CPU).
+          // fp32 for WebGPU (required — q8 garbles output on GPU)
+          // q8 for WASM fallback (smaller, fast enough on CPU)
           let device = 'wasm';
           let dtype = 'q8';
           try {
             if (navigator.gpu) {
               const adapter = await navigator.gpu.requestAdapter();
-              if (adapter) {
-                device = 'webgpu';
-                dtype = 'fp32';
-              }
+              if (adapter) { device = 'webgpu'; dtype = 'fp32'; }
             }
-          } catch(e) {
-            console.log('WebGPU detection failed, using WASM/q8');
-          }
+          } catch(e) { console.log('WebGPU not available, using WASM/q8'); }
+          
           this._currentDevice = device;
-          console.log('[TTS] Loading Kokoro with device=' + device + ', dtype=' + dtype);
+          console.log('[TTS] Loading Kokoro: ' + device + '/' + dtype);
           
           this.tts = await KokoroTTS.from_pretrained(
             'onnx-community/Kokoro-82M-v1.0-ONNX',
             {
-              dtype,
-              device,
+              dtype, device,
               progress_callback: (p) => {
                 if (p.status === 'progress' && p.progress != null) {
                   this.loadProgress = p.progress;
@@ -1187,8 +1169,7 @@
           
           this.status = 'ready';
           if (this.onStatusChange) this.onStatusChange('ready', 100);
-          console.log('[TTS] Kokoro loaded successfully (' + device + '/' + dtype + ')');
-          
+          console.log('[TTS] Loaded (' + device + '/' + dtype + ')');
         } catch (err) {
           console.error('[TTS] Init failed:', err);
           this.status = 'error';
@@ -1198,81 +1179,105 @@
       }
       
       /**
-       * Generate audio for a single text chunk.
-       * Returns an AudioBuffer ready for playback.
+       * Generate audio for text. Single call — no chunking.
+       * Returns an AudioBuffer.
        */
-      async generateChunk(text, voice, speed) {
+      async generate(text, voice, speed) {
         if (!this.tts) throw new Error('Model not loaded');
+        const t0 = performance.now();
         const result = await this.tts.generate(text, {
           voice: voice || 'af_heart',
           speed: speed || 1.0,
         });
-        return this._resultToBuffer(result);
-      }
-      
-      _resultToBuffer(result) {
+        const genTime = ((performance.now() - t0) / 1000).toFixed(1);
+        
         const audioData = result.audio || result;
         const sampleRate = result.sampling_rate || 24000;
-        
         let float32;
-        if (audioData instanceof Float32Array) {
-          float32 = audioData;
-        } else if (audioData.data) {
-          float32 = new Float32Array(audioData.data);
-        } else if (ArrayBuffer.isView(audioData)) {
-          float32 = new Float32Array(audioData.buffer);
-        } else {
-          throw new Error('Unexpected audio format from Kokoro');
-        }
+        if (audioData instanceof Float32Array) float32 = audioData;
+        else if (audioData.data) float32 = new Float32Array(audioData.data);
+        else if (ArrayBuffer.isView(audioData)) float32 = new Float32Array(audioData.buffer);
+        else throw new Error('Unexpected audio format');
         
         const buffer = this.audioContext.createBuffer(1, float32.length, sampleRate);
         buffer.copyToChannel(float32, 0);
+        console.log('[TTS] Generated: ' + genTime + 's → ' + buffer.duration.toFixed(1) + 's audio | "' + text.substring(0, 50) + '..."');
         return buffer;
       }
       
-      // ============================================================
-      // QUEUE-BASED STREAMING PLAYBACK
-      // Generate sentence by sentence, play as each arrives.
-      // Perceived latency = time to generate first sentence (~2-4s)
-      // vs. old approach = time to generate entire paragraph (~10-15s)
-      // ============================================================
-      
       /**
-       * Enqueue an AudioBuffer for playback.
-       * If nothing is currently playing, starts immediately.
+       * Generate audio for a paragraph, optionally splitting dialogue.
+       * If dialogueSplit is true, splits at quote boundaries and uses different voices.
+       * Returns a single AudioBuffer (concatenated if split).
        */
-      enqueue(buffer) {
-        this._queue.push(buffer);
-        this._totalQueueDuration += buffer.duration;
-        
-        // If nothing is playing, start the queue
-        if (!this._isQueuePlaying) {
-          this._playNext();
+      async generateParagraph(text, narratorVoice, dialogueVoice, speed, dialogueSplit) {
+        if (!dialogueSplit) {
+          return this.generate(text, narratorVoice, speed);
         }
+        
+        const segments = splitParagraphForVoices(text);
+        if (segments.length <= 1) {
+          return this.generate(text, narratorVoice, speed);
+        }
+        
+        // Generate each segment with the appropriate voice
+        const buffers = [];
+        for (const seg of segments) {
+          const voice = seg.voice === 'dialogue' ? dialogueVoice : narratorVoice;
+          buffers.push(await this.generate(seg.text, voice, speed));
+        }
+        return this._concatBuffers(buffers);
       }
       
       /**
-       * Play the next buffer in the queue.
-       * Only fires onQueueDrained when queue is empty AND all generation is done.
+       * Pre-generate the next paragraph in the background.
+       * Stores result so playParagraph can use it instantly.
        */
-      async _playNext() {
-        if (this._queue.length === 0) {
-          this._isQueuePlaying = false;
-          
-          // Only signal completion if all chunks have been generated
-          if (this._generationComplete) {
-            console.log('[TTS] Queue drained. Total duration: ' + this._totalQueueDuration.toFixed(1) + 's');
-            if (this._onQueueDrained) this._onQueueDrained();
-          }
-          // Otherwise, generation is still in progress — _playNext will be
-          // called again when the next chunk arrives via enqueue()
-          return;
+      pregenerate(key, text, narratorVoice, dialogueVoice, speed, dialogueSplit) {
+        // Don't pre-gen if already cached for this key
+        if (this._pregenKey === key && this._pregenBuffer) return;
+        
+        this._pregenKey = key;
+        this._pregenBuffer = null;
+        this._pregenPromise = this.generateParagraph(text, narratorVoice, dialogueVoice, speed, dialogueSplit)
+          .then(buf => {
+            this._pregenBuffer = buf;
+            this._pregenPromise = null;
+            console.log('[TTS] Pre-generated: ' + key);
+          })
+          .catch(err => {
+            this._pregenPromise = null;
+            console.warn('[TTS] Pre-gen failed:', err.message);
+          });
+      }
+      
+      /**
+       * Get pre-generated buffer if available for the given key.
+       * If pre-generation is in-flight, awaits it.
+       * Returns null if nothing was pre-generated for this key.
+       */
+      async getPregenerated(key) {
+        if (this._pregenKey !== key) return null;
+        if (this._pregenBuffer) return this._pregenBuffer;
+        if (this._pregenPromise) {
+          await this._pregenPromise;
+          return this._pregenBuffer;
         }
+        return null;
+      }
+      
+      clearPregen() {
+        this._pregenBuffer = null;
+        this._pregenKey = null;
+        this._pregenPromise = null;
+      }
+      
+      /**
+       * Play an AudioBuffer. Returns immediately — use onEnded for completion.
+       */
+      async play(buffer, onEnded) {
+        this.stop();
         
-        this._isQueuePlaying = true;
-        const buffer = this._queue.shift();
-        
-        // Ensure audio context is running
         if (this.audioContext.state === 'suspended') {
           await this.audioContext.resume();
         }
@@ -1282,83 +1287,13 @@
         source.connect(this.gainNode);
         source.onended = () => {
           this.currentSource = null;
-          this._playedDuration += buffer.duration;
-          this._playNext();
+          this._playDuration = 0;
+          if (onEnded) onEnded();
         };
         source.start();
         this.currentSource = source;
-        this._currentBufferStart = this.audioContext.currentTime;
-      }
-      
-      /**
-       * Reset the queue and stop all playback.
-       */
-      clearQueue() {
-        this._queue = [];
-        this._totalQueueDuration = 0;
-        this._playedDuration = 0;
-        this._currentBufferStart = 0;
-        this._isQueuePlaying = false;
-        this._generationComplete = false;
-        this._estimatedTotalDuration = 0;
-        this._onQueueDrained = null;
-        this.stop();
-      }
-      
-      /**
-       * Start streaming a paragraph: splits into voice segments → sentences,
-       * generates each sentence, enqueues for immediate playback.
-       * Returns a promise that resolves when all chunks are generated (not played).
-       * onFirstChunk is called when the first audio chunk starts playing.
-       */
-      async streamParagraph(voiceSegments, speed, onFirstChunk, onAllPlayed, cancelRef) {
-        this.clearQueue();
-        this._onQueueDrained = onAllPlayed;
-        
-        // Estimate total audio duration from text length for stable progress tracking
-        const fullText = voiceSegments.map(s => s.text).join(' ');
-        this.setEstimatedDuration(fullText, speed);
-        
-        let firstChunkSent = false;
-        let chunkCount = 0;
-        
-        for (const seg of voiceSegments) {
-          if (cancelRef && cancelRef.cancelled) return;
-          
-          // Split segment into chunks for streaming (2-3 sentences per chunk)
-          const chunks = splitIntoChunks(seg.text);
-          
-          for (const chunk of chunks) {
-            if (cancelRef && cancelRef.cancelled) return;
-            if (chunk.trim().length < 2) continue; // skip empty
-            
-            const t0 = performance.now();
-            const buffer = await this.generateChunk(chunk.trim(), seg.voice, speed);
-            const genTime = ((performance.now() - t0) / 1000).toFixed(1);
-            chunkCount++;
-            console.log('[TTS] Chunk ' + chunkCount + ' (' + seg.voiceType + '): '
-              + genTime + 's gen → ' + buffer.duration.toFixed(1) + 's audio'
-              + ' | "' + chunk.trim().substring(0, 40) + '..."');
-            
-            this.enqueue(buffer);
-            
-            if (!firstChunkSent) {
-              firstChunkSent = true;
-              if (onFirstChunk) onFirstChunk();
-            }
-          }
-        }
-        
-        // All chunks have been generated and enqueued
-        this._generationComplete = true;
-        console.log('[TTS] All ' + chunkCount + ' chunks generated for paragraph');
-        
-        // If the queue already drained while we were generating the last chunk
-        // (i.e. playback finished before generation finished), fire the callback now
-        if (!this._isQueuePlaying && this._queue.length === 0) {
-          console.log('[TTS] Queue already drained, firing onAllPlayed now');
-          if (this._onQueueDrained) this._onQueueDrained();
-        }
+        this._playStartTime = this.audioContext.currentTime;
+        this._playDuration = buffer.duration;
       }
       
       stop() {
@@ -1366,50 +1301,53 @@
           try { this.currentSource.stop(); } catch(e) {}
           this.currentSource = null;
         }
+        this._playDuration = 0;
       }
       
       pause() {
-        if (this.audioContext && this.audioContext.state === 'running') {
-          this.audioContext.suspend();
-        }
+        if (this.audioContext?.state === 'running') this.audioContext.suspend();
       }
       
       resume() {
-        if (this.audioContext && this.audioContext.state === 'suspended') {
-          this.audioContext.resume();
-        }
+        if (this.audioContext?.state === 'suspended') this.audioContext.resume();
       }
       
       get isPlaying() {
-        return this._isQueuePlaying && this.audioContext?.state === 'running';
+        return this.currentSource !== null && this.audioContext?.state === 'running';
       }
       
-      /**
-       * Progress across the entire paragraph.
-       * Uses estimated duration during streaming (stable denominator).
-       * Switches to actual total duration once all chunks are generated.
-       */
       getProgress() {
-        // Use actual total once generation is complete, estimated during streaming
-        const totalDuration = this._generationComplete
-          ? this._totalQueueDuration
-          : this._estimatedTotalDuration;
-        
-        if (totalDuration <= 0) return 0;
-        
-        let currentElapsed = 0;
-        if (this.currentSource && this._currentBufferStart) {
-          currentElapsed = this.audioContext.currentTime - this._currentBufferStart;
-        }
-        return Math.min(1, (this._playedDuration + currentElapsed) / totalDuration);
+        if (!this.currentSource || !this._playDuration) return 0;
+        const elapsed = this.audioContext.currentTime - this._playStartTime;
+        return Math.min(1, elapsed / this._playDuration);
       }
       
       setVolume(vol) {
         if (this.gainNode) this.gainNode.gain.value = Math.max(0, Math.min(1, vol));
       }
       
+      _concatBuffers(buffers) {
+        if (buffers.length === 0) return null;
+        if (buffers.length === 1) return buffers[0];
+        const sampleRate = buffers[0].sampleRate;
+        const totalLength = buffers.reduce((sum, b) => sum + b.length, 0);
+        const result = this.audioContext.createBuffer(1, totalLength, sampleRate);
+        const channel = result.getChannelData(0);
+        let offset = 0;
+        for (const buf of buffers) {
+          channel.set(buf.getChannelData(0), offset);
+          offset += buf.length;
+        }
+        return result;
+      }
+      
+      fullStop() {
+        this.stop();
+        this.clearPregen();
+      }
+      
       destroy() {
-        this.clearQueue();
+        this.fullStop();
         if (this.audioContext) {
           this.audioContext.close().catch(() => {});
           this.audioContext = null;
@@ -1417,43 +1355,6 @@
         this.tts = null;
         this.status = 'idle';
       }
-    }
-    
-    /**
-     * Split text into chunks for streaming generation.
-     * Targets ~30-60 words per chunk (10-20s of audio) to minimize
-     * per-call overhead while keeping time-to-first-audio reasonable.
-     * Single-sentence paragraphs stay as one chunk.
-     */
-    function splitIntoChunks(text) {
-      // First split into sentences
-      const raw = text.match(/[^.!?]*[.!?]+["'"'\u201D\u2019]?\s*/g);
-      if (!raw || raw.length <= 1) return [text]; // single sentence or no splits
-      
-      // Merge sentences into chunks targeting ~40 words each
-      const TARGET_WORDS = 40;
-      const chunks = [];
-      let current = '';
-      let currentWords = 0;
-      
-      for (const sentence of raw) {
-        const sentenceWords = sentence.trim().split(/\s+/).length;
-        
-        // If adding this sentence would exceed target and we already have content, start new chunk
-        if (currentWords > 0 && currentWords + sentenceWords > TARGET_WORDS) {
-          chunks.push(current.trim());
-          current = sentence;
-          currentWords = sentenceWords;
-        } else {
-          current += sentence;
-          currentWords += sentenceWords;
-        }
-      }
-      
-      // Push remaining
-      if (current.trim()) chunks.push(current.trim());
-      
-      return chunks.filter(c => c.length > 0);
     }
     
     // Singleton instance
@@ -1589,6 +1490,7 @@
       const [listenSpeed, setListenSpeed] = useState(savedPrefs.current.listenSpeed || 1.0);
       const [selectedVoice, setSelectedVoice] = useState(savedPrefs.current.voice || 'af_heart');
       const [dialogueVoice, setDialogueVoice] = useState(savedPrefs.current.dialogueVoice || 'af_bella');
+      const [dialogueSplitEnabled, setDialogueSplitEnabled] = useState(savedPrefs.current.dialogueSplit || false);
       const [modelStatus, setModelStatus] = useState('idle');
       const [modelLoadProgress, setModelLoadProgress] = useState(0);
       const [listenAudioProgress, setListenAudioProgress] = useState(0);
@@ -1679,9 +1581,10 @@
           paragraphPause: paragraphPauseMs,
           wpm, context: contextMode, voice: selectedVoice,
           dialogueVoice: dialogueVoice,
+          dialogueSplit: dialogueSplitEnabled,
           listenSpeed, onboarded: true,
         });
-      }, [themeMode, pausesEnabled, hapticEnabled, wakeLockEnabled, smartPacingEnabled, paragraphPauseMs, wpm, contextMode, selectedVoice, dialogueVoice, listenSpeed]);
+      }, [themeMode, pausesEnabled, hapticEnabled, wakeLockEnabled, smartPacingEnabled, paragraphPauseMs, wpm, contextMode, selectedVoice, dialogueVoice, dialogueSplitEnabled, listenSpeed]);
 
       // ============================================================
       // PARSE CHAPTER TEXT INTO WORDS
@@ -1819,7 +1722,7 @@
           sleepTimerRef.current = setTimeout(() => {
             setIsPlaying(false);
             setIsListenPlaying(false);
-            kokoroManager.clearQueue();
+            kokoroManager.fullStop();
             setSleepMinutes(0);
             setSleepEndTime(null);
           }, sleepMinutes * 60000);
@@ -2035,68 +1938,71 @@
       // ============================================================
       
       // Start/stop listen mode audio
+      // Architecture: one generate() call per paragraph + pre-generate next paragraph
       useEffect(() => {
         if (mode !== 'listen' || !isListenPlaying) return;
         if (modelStatus !== 'ready') return;
         if (paragraphRanges.length === 0) return;
         
-        const cancelRef = { cancelled: false };
-        
-        // Reset progress tracking
+        let cancelled = false;
         setListenAudioProgress(0);
         
-        async function streamCurrentParagraph() {
+        async function playCurrentParagraph() {
           const para = paragraphRanges[listenParagraphIdx];
-          if (!para || cancelRef.cancelled) return;
+          if (!para || cancelled) return;
           
           setIsGenerating(true);
+          const paraKey = chapterIndex + ':' + listenParagraphIdx;
           
           try {
-            // Split into voice segments (narration/dialogue), then tag with actual voice IDs
-            const rawSegments = splitParagraphForVoices(para.text);
-            const voiceSegments = rawSegments.map(s => ({
-              text: s.text,
-              voice: s.voice === 'dialogue' ? dialogueVoice : selectedVoice,
-              voiceType: s.voice,
-            }));
+            // Check if this paragraph was pre-generated
+            let buffer = await kokoroManager.getPregenerated(paraKey);
             
-            const hasDialogue = rawSegments.some(s => s.voice === 'dialogue');
-            console.log('[TTS] Para ' + (listenParagraphIdx + 1) + '/' + paragraphRanges.length
-              + ' → ' + voiceSegments.length + ' segment(s)'
-              + (hasDialogue ? ' (with dialogue)' : ''));
+            if (buffer) {
+              console.log('[TTS] Using pre-generated audio for para ' + (listenParagraphIdx + 1));
+            } else {
+              // Generate from scratch
+              console.log('[TTS] Generating para ' + (listenParagraphIdx + 1) + '/' + paragraphRanges.length);
+              buffer = await kokoroManager.generateParagraph(
+                para.text, selectedVoice, dialogueVoice, listenSpeed, dialogueSplitEnabled
+              );
+            }
             
-            // Stream: generates sentence-by-sentence, plays as each chunk arrives
-            await kokoroManager.streamParagraph(
-              voiceSegments,
-              listenSpeed,
-              // onFirstChunk — audio has started playing
-              () => {
-                if (!cancelRef.cancelled) setIsGenerating(false);
-              },
-              // onAllPlayed — entire paragraph audio finished
-              () => {
-                if (cancelRef.cancelled) return;
-                // Auto-advance to next paragraph
-                setListenParagraphIdx(prev => {
-                  const next = prev + 1;
-                  if (next >= paragraphRanges.length) {
-                    if (book && chapterIndex < book.chapters.length - 1) {
-                      chapterPositionsRef.current[chapterIndex] = words.length - 1;
-                      if (book) saveChapterPositions(book.title, chapterPositionsRef.current);
-                      const nextCh = chapterIndex + 1;
-                      setChapterIndex(nextCh);
-                      setIsListenPlaying(false);
-                      triggerChapterSplash(nextCh, false);
-                      return 0;
-                    }
+            if (cancelled) return;
+            setIsGenerating(false);
+            
+            // Start playing
+            await kokoroManager.play(buffer, () => {
+              if (cancelled) return;
+              // Auto-advance to next paragraph
+              setListenParagraphIdx(prev => {
+                const next = prev + 1;
+                if (next >= paragraphRanges.length) {
+                  if (book && chapterIndex < book.chapters.length - 1) {
+                    chapterPositionsRef.current[chapterIndex] = words.length - 1;
+                    if (book) saveChapterPositions(book.title, chapterPositionsRef.current);
+                    const nextCh = chapterIndex + 1;
+                    setChapterIndex(nextCh);
                     setIsListenPlaying(false);
-                    return prev;
+                    triggerChapterSplash(nextCh, false);
+                    return 0;
                   }
-                  return next;
-                });
-              },
-              cancelRef,
-            );
+                  setIsListenPlaying(false);
+                  return prev;
+                }
+                return next;
+              });
+            });
+            
+            // Pre-generate NEXT paragraph while current one plays
+            const nextIdx = listenParagraphIdx + 1;
+            if (nextIdx < paragraphRanges.length && !cancelled) {
+              const nextPara = paragraphRanges[nextIdx];
+              const nextKey = chapterIndex + ':' + nextIdx;
+              kokoroManager.pregenerate(
+                nextKey, nextPara.text, selectedVoice, dialogueVoice, listenSpeed, dialogueSplitEnabled
+              );
+            }
             
             // Update media session
             if (book) {
@@ -2109,19 +2015,19 @@
             }
             
           } catch(err) {
-            console.error('[TTS] Streaming error:', err);
+            console.error('[TTS] Generation error:', err);
             setIsGenerating(false);
             setIsListenPlaying(false);
           }
         }
         
-        streamCurrentParagraph();
+        playCurrentParagraph();
         
         return () => {
-          cancelRef.cancelled = true;
-          kokoroManager.clearQueue();
+          cancelled = true;
+          kokoroManager.stop();
         };
-      }, [mode, isListenPlaying, listenParagraphIdx, modelStatus, paragraphRanges, selectedVoice, dialogueVoice, listenSpeed, book, chapterIndex, triggerChapterSplash]);
+      }, [mode, isListenPlaying, listenParagraphIdx, modelStatus, paragraphRanges, selectedVoice, dialogueVoice, dialogueSplitEnabled, listenSpeed, book, chapterIndex, triggerChapterSplash]);
       
       // Track audio progress for paragraph highlight
       useEffect(() => {
@@ -2163,7 +2069,7 @@
         setLoadError(null);
         setIsPlaying(false);
         setIsListenPlaying(false);
-        kokoroManager.clearQueue();
+        kokoroManager.fullStop();
         
         try {
           const parsed = await parseEPUB(file);
@@ -2211,7 +2117,7 @@
       const handleReset = () => {
         setIsPlaying(false);
         setIsListenPlaying(false);
-        kokoroManager.clearQueue();
+        kokoroManager.fullStop();
         setCurrentIndex(0);
         setListenParagraphIdx(0);
         setInDialogue(false);
@@ -2246,7 +2152,7 @@
         // Stop everything first
         setIsPlaying(false);
         setIsListenPlaying(false);
-        kokoroManager.clearQueue();
+        kokoroManager.fullStop();
         
         if (mode === 'rsvp') {
           // Switching to listen mode
@@ -2287,7 +2193,7 @@
         if (mode === 'listen') {
           setListenParagraphIdx(p => Math.max(0, p - 1));
           setIsListenPlaying(false);
-          kokoroManager.clearQueue();
+          kokoroManager.fullStop();
           if (hapticEnabled) haptic(10);
           showNavFeedback('back');
           return;
@@ -2308,7 +2214,7 @@
         if (mode === 'listen') {
           setListenParagraphIdx(p => Math.min(paragraphRanges.length - 1, p + 1));
           setIsListenPlaying(false);
-          kokoroManager.clearQueue();
+          kokoroManager.fullStop();
           if (hapticEnabled) haptic(10);
           showNavFeedback('forward');
           return;
@@ -2328,7 +2234,7 @@
         
         setIsPlaying(false);
         setIsListenPlaying(false);
-        kokoroManager.clearQueue();
+        kokoroManager.fullStop();
         setChapterIndex(newIndex);
         setCurrentIndex(0);
         setListenParagraphIdx(0);
@@ -2363,7 +2269,7 @@
         setCurrentIndex(0);
         setIsPlaying(false);
         setIsListenPlaying(false);
-        kokoroManager.clearQueue();
+        kokoroManager.fullStop();
         setInDialogue(false);
         setShowChapterSplash(false);
         setListenParagraphIdx(0);
@@ -2805,7 +2711,7 @@
             e('div', { key: 'voice', className: 'settings-section' }, [
               e('div', { key: 'l', className: 'settings-label' }, 'Voices (Listen Mode)'),
               e('div', { key: 'narrator', className: 'settings-row' }, [
-                e('span', { key: 'rl', className: 'settings-row-label' }, 'Narrator'),
+                e('span', { key: 'rl', className: 'settings-row-label' }, 'Voice'),
                 e('select', {
                   key: 'sel',
                   className: 'settings-select',
@@ -2815,8 +2721,12 @@
                   e('option', { key: v.id, value: v.id }, v.name + ' (' + v.rating + ') ' + (v.gender === 'F' ? '\u2640' : '\u2642'))
                 )),
               ]),
-              e('div', { key: 'dialogue', className: 'settings-row' }, [
-                e('span', { key: 'rl', className: 'settings-row-label' }, 'Dialogue'),
+              e('div', { key: 'splitToggle', className: 'settings-row' }, [
+                e('span', { key: 'rl', className: 'settings-row-label' }, 'Dialogue Voice Splitting'),
+                e('button', { key: 'tog', className: 'settings-toggle ' + (dialogueSplitEnabled ? 'active' : ''), onClick: () => setDialogueSplitEnabled(!dialogueSplitEnabled) }),
+              ]),
+              dialogueSplitEnabled && e('div', { key: 'dialogue', className: 'settings-row' }, [
+                e('span', { key: 'rl', className: 'settings-row-label' }, 'Dialogue Voice'),
                 e('select', {
                   key: 'sel',
                   className: 'settings-select',
@@ -2826,8 +2736,8 @@
                   e('option', { key: v.id, value: v.id }, v.name + ' (' + v.rating + ') ' + (v.gender === 'F' ? '\u2640' : '\u2642'))
                 )),
               ]),
-              e('div', { key: 'voicenote', style: { fontSize: '0.6875rem', color: theme.muted, marginTop: '0.25rem' } },
-                'Narrator reads prose; Dialogue reads quoted text'),
+              dialogueSplitEnabled && e('div', { key: 'voicenote', style: { fontSize: '0.6875rem', color: theme.muted, marginTop: '0.25rem' } },
+                'Slower generation — uses separate voice for quoted text'),
               e('div', { key: 'speed', className: 'settings-row' }, [
                 e('span', { key: 'sl', className: 'settings-row-label' }, 'Listen Speed: ' + listenSpeed.toFixed(1) + 'x'),
                 e('input', {
