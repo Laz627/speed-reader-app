@@ -1,4 +1,4 @@
-const CACHE_NAME = 'speedreader-v7';
+const CACHE_NAME = 'speedreader-v8';
 const ASSETS = [
   './',
   './index.html',
@@ -8,10 +8,10 @@ const ASSETS = [
   'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js',
 ];
 
-// NOTE: Kokoro model files are NOT cached here.
-// They are cached in IndexedDB by transformers.js automatically.
-// The transformers.js library itself is loaded via dynamic import()
-// and cached by the browser's standard HTTP cache.
+// NOTE: Piper TTS model files (.onnx) and WASM binaries are NOT cached here.
+// Models are cached in Origin Private File System (OPFS) by piper-tts-web.
+// ONNX Runtime WASM and phonemizer WASM load from jsdelivr CDN
+// and are cached by the browser's standard HTTP cache.
 
 // Install - cache core assets
 self.addEventListener('install', (event) => {
@@ -40,9 +40,9 @@ self.addEventListener('fetch', (event) => {
   // Skip non-GET requests
   if (event.request.method !== 'GET') return;
 
-  // Skip cross-origin model/wasm requests (let transformers.js handle caching)
+  // Skip cross-origin model/wasm requests (let piper-tts-web handle caching)
   const url = new URL(event.request.url);
-  if (url.pathname.includes('.onnx') || url.pathname.includes('.wasm')) {
+  if (url.pathname.includes('.onnx') || url.pathname.includes('.wasm') || url.pathname.includes('.data')) {
     return;
   }
 
