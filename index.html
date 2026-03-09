@@ -2464,16 +2464,16 @@
               );
             }
             
-            // Pre-generate next 2 paragraphs while current plays
-            // Disabled on mobile: single GPU can't parallelize, pre-gen just
-            // queues behind current sentence and adds latency to everything
-            if (!IS_MOBILE) {
-              for (let ahead = 1; ahead <= 2; ahead++) {
-                const futureIdx = listenParagraphIdx + ahead;
-                if (futureIdx < paragraphRanges.length && !cancelled) {
-                  const futureKey = chapterIndex + ':' + futureIdx;
-                  ttsManager.pregenerate(futureKey, paragraphRanges[futureIdx].text, selectedVoice, listenSpeed);
-                }
+            // Pre-generate next paragraph(s) while current plays.
+            // Mobile (paragraph chunking): GPU is idle during playback, so
+            // pre-gen of next paragraph runs uncontested. 1 ahead is enough.
+            // Desktop (sentence streaming): 2 ahead for seamless transitions.
+            const lookAhead = IS_MOBILE ? 1 : 2;
+            for (let ahead = 1; ahead <= lookAhead; ahead++) {
+              const futureIdx = listenParagraphIdx + ahead;
+              if (futureIdx < paragraphRanges.length && !cancelled) {
+                const futureKey = chapterIndex + ':' + futureIdx;
+                ttsManager.pregenerate(futureKey, paragraphRanges[futureIdx].text, selectedVoice, listenSpeed);
               }
             }
             
