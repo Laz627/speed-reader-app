@@ -2527,6 +2527,38 @@
             return;
           }
           
+          // === CHAPTER WARMUP ===
+          // On first paragraph of chapter (on mobile), spend up to 45s
+          // pre-generating as many paragraphs as possible before starting playback.
+          // This builds a deep cache so the rolling pre-gen never falls behind.
+          if (IS_MOBILE && listenParagraphIdx === 0 && !ttsManager._preCache[chapterIndex + ':0']) {
+            debugLog('[WARMUP] Starting chapter warmup (45s max)...');
+            setIsGenerating(true);
+            const warmupStart = Date.now();
+            const warmupLimit = 45000; // 45 seconds
+            
+            for (let i = 0; i < Math.min(paragraphRanges.length, 15); i++) {
+              if (cancelled) break;
+              if (Date.now() - warmupStart > warmupLimit) {
+                debugLog('[WARMUP] Time limit reached at para ' + (i + 1));
+                break;
+              }
+              
+              const key = chapterIndex + ':' + i;
+              if (ttsManager._preCache[key] || ttsManager._prePromises[key]) continue;
+              
+              ttsManager.pregenerate(key, paragraphRanges[i].text, selectedVoice, listenSpeed);
+              if (ttsManager._prePromises[key]) {
+                await ttsManager._prePromises[key];
+              }
+              
+              debugLog('[WARMUP] Cached para ' + (i + 1) + ' (' + Math.round((Date.now() - warmupStart) / 1000) + 's elapsed)');
+            }
+            
+            debugLog('[WARMUP] Done — ' + Object.keys(ttsManager._preCache).length + ' paragraphs cached');
+            if (cancelled) return;
+          }
+          
           debugLog('[PLAY] Para ' + (listenParagraphIdx + 1) + '/' + paragraphRanges.length + ': "' + para.text.substring(0, 60) + '..."');
           setIsGenerating(true);
           const paraKey = chapterIndex + ':' + listenParagraphIdx;
