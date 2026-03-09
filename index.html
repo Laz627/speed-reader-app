@@ -2572,26 +2572,40 @@
           const paraKey = chapterIndex + ':' + listenParagraphIdx;
           
           // On mobile, first paragraph: wait for pre-gen to build a buffer.
-          // This prevents lockstep where play consumes cache as fast as pre-gen fills it.
+          // Buffer by AUDIO DURATION, not paragraph count — 3 short chapter headers
+          // (2s each) shouldn't count the same as 3 real paragraphs (30s each).
+          // Target: 120s of cached audio before starting playback.
           if (IS_MOBILE && listenParagraphIdx === 0) {
             setIsGenerating(true);
-            const bufferTarget = Math.min(8, paragraphRanges.length); // Wait for 8 paragraphs
-            const maxWait = 60000; // Give up after 60s
+            const targetDuration = 120; // seconds of cached audio before starting
+            const maxWait = 90000; // give up after 90s of wall clock
             const started = Date.now();
             
-            debugLog('[BUFFER] Waiting for ' + bufferTarget + ' paragraphs to cache...');
+            debugLog('[BUFFER] Buffering ~' + targetDuration + 's of audio before playback...');
             
             while (!cancelled) {
-              let cached = 0;
-              for (let i = 0; i < bufferTarget; i++) {
-                if (ttsManager._preCache[chapterIndex + ':' + i]) cached++;
+              let totalCachedDuration = 0;
+              let cachedCount = 0;
+              for (let i = 0; i < paragraphRanges.length; i++) {
+                const buf = ttsManager._preCache[chapterIndex + ':' + i];
+                if (buf) {
+                  totalCachedDuration += buf.duration;
+                  cachedCount++;
+                } else {
+                  break; // Only count contiguous cached paragraphs from start
+                }
               }
-              if (cached >= bufferTarget) {
-                debugLog('[BUFFER] Ready — ' + cached + ' paragraphs cached (' + Math.round((Date.now() - started) / 1000) + 's)');
+              
+              if (totalCachedDuration >= targetDuration) {
+                debugLog('[BUFFER] Ready — ' + cachedCount + ' paragraphs, ' + Math.round(totalCachedDuration) + 's audio (' + Math.round((Date.now() - started) / 1000) + 's wait)');
+                break;
+              }
+              if (cachedCount >= paragraphRanges.length) {
+                debugLog('[BUFFER] Entire chapter cached — ' + cachedCount + ' paragraphs, ' + Math.round(totalCachedDuration) + 's audio');
                 break;
               }
               if (Date.now() - started > maxWait) {
-                debugLog('[BUFFER] Timeout — ' + cached + '/' + bufferTarget + ' cached, starting anyway');
+                debugLog('[BUFFER] Timeout — ' + cachedCount + ' paragraphs, ' + Math.round(totalCachedDuration) + 's audio, starting anyway');
                 break;
               }
               await new Promise(r => setTimeout(r, 500));
