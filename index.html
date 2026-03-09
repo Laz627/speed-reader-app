@@ -1144,42 +1144,75 @@
             const stream = tts.stream(payload.text, { voice: payload.voice, speed: payload.speed });
             let idx = 0;
             for await (const chunk of stream) {
-              // stream() yields { text, phonemes, audio } where audio may be:
-              // - Float32Array directly
-              // - RawAudio { audio: Float32Array, sampling_rate: N }
-              // - Tensor-like { data: Float32Array }
-              // - Nested: chunk.audio.audio for double-wrapped RawAudio
-              let audioSrc = chunk.audio;
+              // Comprehensive audio extraction from stream() chunks.
+              // The shape varies by kokoro-js version and device backend.
+              let raw = null;
               let sr = 24000;
+              let debugInfo = '';
               
-              // Unwrap RawAudio: if audioSrc has .audio, go deeper
-              if (audioSrc && audioSrc.audio !== undefined) {
-                sr = audioSrc.sampling_rate || audioSrc.sampleRate || 24000;
-                audioSrc = audioSrc.audio;
+              try {
+                const a = chunk.audio;
+                debugInfo = 'audio type=' + typeof a;
+                
+                if (!a) {
+                  debugInfo += ' (null/undefined)';
+                } else if (a instanceof Float32Array) {
+                  raw = a;
+                  debugInfo = 'Float32Array direct';
+                } else if (a.audio instanceof Float32Array) {
+                  // RawAudio wrapper: { audio: Float32Array, sampling_rate: N }
+                  raw = a.audio;
+                  sr = a.sampling_rate || sr;
+                  debugInfo = 'RawAudio wrapper';
+                } else if (a.data instanceof Float32Array) {
+                  // Tensor: { data: Float32Array, dims: [...] }
+                  raw = a.data;
+                  debugInfo = 'Tensor .data';
+                } else if (a.audio?.data instanceof Float32Array) {
+                  // Double-wrapped: { audio: { data: Float32Array } }
+                  raw = a.audio.data;
+                  sr = a.sampling_rate || sr;
+                  debugInfo = 'Nested Tensor';
+                } else if (a.audio?.data) {
+                  // Tensor with non-typed data
+                  raw = new Float32Array(a.audio.data);
+                  sr = a.sampling_rate || sr;
+                  debugInfo = 'Nested data array';
+                } else if (a.data) {
+                  raw = new Float32Array(a.data);
+                  debugInfo = 'data array';
+                } else if (typeof a.toFloat32Array === 'function') {
+                  raw = a.toFloat32Array();
+                  debugInfo = 'toFloat32Array()';
+                } else if (Array.isArray(a)) {
+                  raw = new Float32Array(a);
+                  debugInfo = 'plain array';
+                } else {
+                  // Last resort: try to enumerate what we have
+                  const keys = Object.keys(a).join(',');
+                  const proto = Object.getPrototypeOf(a)?.constructor?.name || 'unknown';
+                  debugInfo = 'unknown: keys=[' + keys + '] proto=' + proto;
+                  // Try accessing by common property names
+                  if (a.waveform instanceof Float32Array) { raw = a.waveform; debugInfo = 'waveform'; }
+                  else if (a.samples instanceof Float32Array) { raw = a.samples; debugInfo = 'samples'; }
+                  else if (a.buffer instanceof Float32Array) { raw = a.buffer; debugInfo = 'buffer'; }
+                }
+                
+                // Also check chunk-level sampling_rate
+                if (chunk.sampling_rate) sr = chunk.sampling_rate;
+                
+              } catch(ex) {
+                debugInfo = 'extraction error: ' + ex.message;
               }
               
-              // Extract Float32Array
-              let raw;
-              if (audioSrc instanceof Float32Array) raw = audioSrc;
-              else if (audioSrc && audioSrc.data) raw = new Float32Array(audioSrc.data);
-              else if (Array.isArray(audioSrc)) raw = new Float32Array(audioSrc);
-              else if (typeof audioSrc?.toFloat32Array === 'function') raw = audioSrc.toFloat32Array();
-              else raw = new Float32Array(0);
+              const samples = raw && raw.length > 0 ? Array.from(raw) : [];
               
-              // Also check chunk-level sampling_rate
-              if (chunk.sampling_rate) sr = chunk.sampling_rate;
-              
-              if (raw.length === 0) {
-                console.warn('[Worker] Empty audio chunk, skipping. Keys:', Object.keys(chunk));
-                continue;
-              }
-              
-              // Transfer samples to main thread
               self.postMessage({
                 type: 'chunk', id, idx,
-                samples: Array.from(raw),
+                samples: samples,
                 sampleRate: sr,
                 text: (chunk.text || '').substring(0, 50),
+                debug: debugInfo,
               });
               idx++;
             }
@@ -1288,6 +1321,10 @@
         
         // Main stream messages
         if (m.type === 'chunk') {
+          if (!m.samples || m.samples.length === 0) {
+            console.warn('[TTS] Received empty chunk, skipping. Debug:', m.debug || 'none');
+            return;
+          }
           const float32 = new Float32Array(m.samples);
           const buffer = this.audioContext.createBuffer(1, float32.length, m.sampleRate);
           buffer.copyToChannel(float32, 0);
