@@ -1336,7 +1336,7 @@
               const trimmedS = s.trim();
               if (!trimmedS) continue;
               // Start new chunk if adding this sentence would exceed ~400 chars
-              if (current.length > 0 && (current.length + trimmedS.length) > 400) {
+              if (current.length > 0 && (current.length + trimmedS.length) > 300) {
                 chunks.push(current);
                 current = trimmedS;
               } else {
@@ -1461,7 +1461,7 @@
             for (const s of sentences) {
               const t = s.trim();
               if (!t) continue;
-              if (current.length > 0 && (current.length + t.length) > 400) {
+              if (current.length > 0 && (current.length + t.length) > 300) {
                 chunks.push(current);
                 current = t;
               } else {
@@ -3147,58 +3147,16 @@
         const para = paragraphRanges[listenParagraphIdx];
         if (!para) return e('div', { style: { color: theme.muted, textAlign: 'center' } }, 'No paragraph available');
         
-        return e('div', { style: { display: 'flex', flexDirection: 'column', alignItems: 'center', width: '100%', height: '100%', overflow: 'hidden', padding: '1rem' } }, [
+        return e('div', { style: { display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', width: '100%', height: '100%', padding: '1rem' } }, [
           // Paragraph number indicator
-          e('div', { key: 'para-num', style: { fontSize: '0.6875rem', fontWeight: '600', textTransform: 'uppercase', letterSpacing: '0.1em', color: theme.muted, marginBottom: '0.75rem', flexShrink: 0 } },
+          e('div', { key: 'para-num', style: { fontSize: '0.6875rem', fontWeight: '600', textTransform: 'uppercase', letterSpacing: '0.1em', color: theme.muted, marginBottom: '0.75rem' } },
             '\u00B6 ' + (listenParagraphIdx + 1) + ' / ' + paragraphRanges.length
             + (isGenerating ? ' \u2022 Generating...' : isListenPlaying ? ' \u2022 Playing' : '')),
-          
-          // Scrollable paragraph container — auto-scrolls to keep highlighted word visible
-          e('div', {
-            key: 'para-scroll',
-            style: {
-              flex: '1 1 0',
-              minHeight: 0,
-              maxHeight: '60vh',
-              overflow: 'auto',
-              width: '100%',
-              display: 'flex',
-              justifyContent: 'center',
-              WebkitOverflowScrolling: 'touch',
-            }
-          },
-            e('div', {
-              key: 'para-text',
-              className: 'listen-paragraph',
-              style: {
-                fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
-                color: theme.text,
-              }
-            }, (() => {
-              const paraWords = para.text.split(/\s+/);
-              const highlightIdx = Math.floor(listenAudioProgress * paraWords.length);
-              return paraWords.map((w, i) =>
-                e('span', {
-                  key: i,
-                  ref: (isListenPlaying && i === highlightIdx) ? (el) => {
-                    // Auto-scroll highlighted word into view
-                    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                  } : undefined,
-                  className: 'listen-word' + (isListenPlaying && i === highlightIdx ? ' active' : ''),
-                  style: {
-                    opacity: isListenPlaying ? (i < highlightIdx ? 0.5 : i === highlightIdx ? 1 : 0.85) : 1,
-                    transition: 'opacity 0.15s, background-color 0.1s',
-                    fontWeight: isListenPlaying && i === highlightIdx ? '600' : '400',
-                  }
-                }, w + (i < paraWords.length - 1 ? ' ' : ''))
-              );
-            })()),
-          ),
           
           // Audio progress bar
           (isListenPlaying || listenAudioProgress > 0) && e('div', {
             key: 'audio-progress',
-            style: { width: '80%', maxWidth: '20rem', height: '3px', borderRadius: '2px', background: theme.cardBorder, marginTop: '1rem', overflow: 'hidden', flexShrink: 0 }
+            style: { width: '80%', maxWidth: '20rem', height: '3px', borderRadius: '2px', background: theme.cardBorder, marginTop: '1rem', overflow: 'hidden' }
           }, e('div', { style: { height: '100%', width: (listenAudioProgress * 100) + '%', background: theme.accent, transition: 'width 0.15s' } })),
         ]);
       };
