@@ -1,4 +1,4 @@
-const CACHE_NAME = 'speedreader-v9';
+const CACHE_NAME = 'speedreader-v10';
 const ASSETS = [
   './',
   './index.html',
@@ -8,10 +8,9 @@ const ASSETS = [
   'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js',
 ];
 
-// NOTE: Piper TTS model files (.onnx) and WASM binaries are NOT cached here.
-// Models are cached in Origin Private File System (OPFS) by piper-tts-web.
-// ONNX Runtime WASM and phonemizer WASM load from jsdelivr CDN
-// and are cached by the browser's standard HTTP cache.
+// NOTE: Voice generation is now server-side via HuggingFace Space API.
+// No local model files, WASM, or ONNX to cache.
+// Audio responses are transient (played and discarded).
 
 // Install - cache core assets
 self.addEventListener('install', (event) => {
@@ -40,9 +39,9 @@ self.addEventListener('fetch', (event) => {
   // Skip non-GET requests
   if (event.request.method !== 'GET') return;
 
-  // Skip cross-origin model/wasm requests (let piper-tts-web handle caching)
+  // Skip HuggingFace Space API requests (SSE, audio files, queue)
   const url = new URL(event.request.url);
-  if (url.pathname.includes('.onnx') || url.pathname.includes('.wasm') || url.pathname.includes('.data')) {
+  if (url.hostname.includes('hf.space') || url.hostname.includes('huggingface.co')) {
     return;
   }
 

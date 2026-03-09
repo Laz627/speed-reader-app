@@ -10,17 +10,6 @@
   
   <title>Speed Reader</title>
   
-  <!-- Import map: resolves bare "onnxruntime-web" specifier for Piper TTS.
-       esm.sh rewrites onnxruntime-web's internal dynamic imports so they
-       resolve correctly in the browser without a bundler. -->
-  <script type="importmap">
-  {
-    "imports": {
-      "onnxruntime-web": "https://esm.sh/onnxruntime-web@1.18.0"
-    }
-  }
-  </script>
-  
   <link rel="manifest" href="manifest.json">
   <link rel="apple-touch-icon" href="icon-192.png">
   
@@ -1125,35 +1114,17 @@
     // ============================================================
     
     // ============================================================
-    // PIPER TTS MANAGER
-    // Uses @mintplex-labs/piper-tts-web for browser-based TTS.
-    // Piper (VITS architecture) is fast on WASM/CPU — works on mobile.
-    // Models load from HuggingFace CDN, ONNX WASM from Cloudflare CDN,
-    // phonemizer from jsdelivr. Models cache in Origin Private File System.
+    // KOKORO TTS MANAGER — HuggingFace Space API Backend
+    // Uses hexgrad/Kokoro-TTS public Gradio space for inference.
+    // Same Kokoro model, same voices, same quality — runs on HF GPUs.
+    // Phone just plays audio, no local inference needed.
+    // Zero cost — the public space is free.
     // ============================================================
     
-    // Curated English voices for the reader
-    const PIPER_VOICES = {
-      'en_US-lessac-medium':   { label: 'Lessac (US, neutral)',    gender: 'F', quality: 'medium' },
-      'en_US-lessac-high':     { label: 'Lessac HD (US, neutral)', gender: 'F', quality: 'high' },
-      'en_US-amy-medium':      { label: 'Amy (US, clear)',         gender: 'F', quality: 'medium' },
-      'en_US-hfc_female-medium': { label: 'HFC Female (US)',       gender: 'F', quality: 'medium' },
-      'en_US-kristin-medium':  { label: 'Kristin (US)',            gender: 'F', quality: 'medium' },
-      'en_US-hfc_male-medium': { label: 'HFC Male (US)',           gender: 'M', quality: 'medium' },
-      'en_US-joe-medium':      { label: 'Joe (US)',                gender: 'M', quality: 'medium' },
-      'en_US-ryan-medium':     { label: 'Ryan (US)',               gender: 'M', quality: 'medium' },
-      'en_US-ryan-high':       { label: 'Ryan HD (US)',            gender: 'M', quality: 'high' },
-      'en_US-bryce-medium':    { label: 'Bryce (US)',              gender: 'M', quality: 'medium' },
-      'en_GB-cori-high':       { label: 'Cori HD (UK)',            gender: 'F', quality: 'high' },
-      'en_GB-alba-medium':     { label: 'Alba (UK, Scottish)',     gender: 'F', quality: 'medium' },
-      'en_GB-alan-medium':     { label: 'Alan (UK)',               gender: 'M', quality: 'medium' },
-      'en_GB-northern_english_male-medium': { label: 'Northern Male (UK)', gender: 'M', quality: 'medium' },
-    };
-
-    class PiperTTSManager {
+    const HF_SPACE = 'https://hexgrad-kokoro-tts.hf.space';
+    
+    class KokoroTTSManager {
       constructor() {
-        this.session = null;   // TtsSession from piper-tts-web
-        this.piperLib = null;  // Imported library module
         this.audioContext = null;
         this.currentSource = null;
         this.gainNode = null;
@@ -1161,9 +1132,8 @@
         this.loadProgress = 0;
         this.onStatusChange = null;
         this.onProgressChange = null;
-        this._currentSpeed = 1.0; // Applied via playbackRate
         
-        // Playback queue (same architecture as before)
+        // Playback queue
         this._queue = [];
         this._playing = false;
         this._onDone = null;
@@ -1179,9 +1149,12 @@
         // Pre-gen cache
         this._preCache = {};
         this._prePromises = {};
+        
+        // Session hash for Gradio queue API
+        this._session = Math.random().toString(36).slice(2, 12);
       }
       
-      async init(onProgress, voiceId) {
+      async init(onProgress) {
         if (this.status === 'ready') return;
         if (this.status === 'loading') return;
         this.status = 'loading';
@@ -1189,58 +1162,52 @@
         if (this.onStatusChange) this.onStatusChange('loading', 0);
         
         try {
-          // Import piper-tts-web from jsdelivr (NOT esm.sh — esm.sh can't
-          // resolve onnxruntime-web's internal WASM module imports properly).
-          // The importmap in <head> resolves bare "onnxruntime-web" to jsdelivr.
-          console.log('[TTS] Loading piper-tts-web...');
-          this.piperLib = await import('https://cdn.jsdelivr.net/npm/@mintplex-labs/piper-tts-web@1.0.4/dist/piper-tts-web.js');
-          
-          const selectedVoice = voiceId || 'en_US-lessac-medium';
-          console.log('[TTS] Loading voice: ' + selectedVoice);
-          
-          // Explicit WASM paths for reliable loading:
-          // - ONNX WASM binaries (.wasm files) from cdnjs — the default, but explicit to be safe
-          // - Piper phonemizer WASM/data from jsdelivr
-          // Note: The JS module for onnxruntime-web is resolved via importmap → esm.sh,
-          // but the actual WASM binaries are fetched separately via these paths.
-          const wasmPaths = {
-            onnxWasm: 'https://cdnjs.cloudflare.com/ajax/libs/onnxruntime-web/1.18.0/',
-            piperData: 'https://cdn.jsdelivr.net/npm/@diffusionstudio/piper-wasm@1.0.0/build/piper_phonemize.data',
-            piperWasm: 'https://cdn.jsdelivr.net/npm/@diffusionstudio/piper-wasm@1.0.0/build/piper_phonemize.wasm',
-          };
-          
-          // Download model (progress callback for UI)
-          await this.piperLib.download(selectedVoice, (p) => {
-            if (p.total > 0) {
-              const pct = Math.round((p.loaded / p.total) * 100);
-              this.loadProgress = pct;
-              if (this.onStatusChange) this.onStatusChange('loading', pct);
-              if (this.onProgressChange) this.onProgressChange(pct);
-            }
-          });
-          
-          // Create TTS session with explicit WASM paths
-          this.session = await this.piperLib.TtsSession.create({
-            voiceId: selectedVoice,
-            wasmPaths,
-            progress: (p) => {
-              if (p && p.total > 0) {
-                const pct = Math.round((p.loaded / p.total) * 100);
-                this.loadProgress = pct;
-                if (this.onStatusChange) this.onStatusChange('loading', pct);
-                if (this.onProgressChange) this.onProgressChange(pct);
-              }
-            },
-          });
-          
           // Set up audio output
           this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
           this.gainNode = this.audioContext.createGain();
           this.gainNode.connect(this.audioContext.destination);
           
+          // Ping the HF Space to wake it up (spaces sleep after inactivity).
+          // This is the ~30s wait on cold start. Once awake, it stays up.
+          console.log('[TTS] Waking up HuggingFace Space...');
+          if (this.onStatusChange) this.onStatusChange('loading', 10);
+          
+          const wakeStart = Date.now();
+          let awake = false;
+          for (let attempt = 0; attempt < 60; attempt++) { // Up to 60s timeout
+            try {
+              const res = await fetch(HF_SPACE + '/gradio_api/queue/join', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  data: ['Wake up test.', 'af_heart', 1.0, false],
+                  fn_index: 4,
+                  session_hash: this._session,
+                }),
+              });
+              if (res.ok) {
+                const { event_id } = await res.json();
+                // Wait for the result to confirm the space is processing
+                await this._waitForResult(event_id);
+                awake = true;
+                break;
+              }
+            } catch(e) {
+              // Space probably still waking — retry
+            }
+            const elapsed = (Date.now() - wakeStart) / 1000;
+            const pct = Math.min(90, Math.round((elapsed / 30) * 80) + 10);
+            if (this.onStatusChange) this.onStatusChange('loading', pct);
+            if (this.onProgressChange) this.onProgressChange(pct);
+            await new Promise(r => setTimeout(r, 2000));
+          }
+          
+          if (!awake) throw new Error('HuggingFace Space did not respond after 60s');
+          
           this.status = 'ready';
           if (this.onStatusChange) this.onStatusChange('ready', 100);
-          console.log('[TTS] Ready (Piper WASM, voice: ' + selectedVoice + ')');
+          const elapsed = ((Date.now() - wakeStart) / 1000).toFixed(1);
+          console.log('[TTS] Ready (HuggingFace Space, ' + elapsed + 's wake time)');
         } catch (err) {
           console.error('[TTS] Init failed:', err);
           this.status = 'error';
@@ -1249,31 +1216,119 @@
         }
       }
       
-      // Convert WAV Blob from piper predict() to AudioBuffer
-      async _wavToBuffer(wavBlob) {
-        const arrayBuf = await wavBlob.arrayBuffer();
+      // ============================================================
+      // GRADIO QUEUE API: join queue → SSE for result → fetch audio
+      // ============================================================
+      
+      // Wait for SSE result from Gradio queue, return audio URL
+      _waitForResult(eventId) {
+        return new Promise((resolve, reject) => {
+          const es = new EventSource(HF_SPACE + '/gradio_api/queue/data?session_hash=' + this._session);
+          const timeout = setTimeout(() => { es.close(); reject(new Error('TTS timeout')); }, 120000);
+          
+          es.onmessage = (msg) => {
+            try {
+              const data = JSON.parse(msg.data);
+              if (data.msg === 'process_completed') {
+                es.close();
+                clearTimeout(timeout);
+                if (data.success && data.output?.data?.[0]?.url) {
+                  resolve(data.output.data[0].url);
+                } else if (data.success && data.output?.data?.[0]?.path) {
+                  // Construct URL from path
+                  resolve(HF_SPACE + '/gradio_api/file=' + data.output.data[0].path);
+                } else {
+                  reject(new Error('TTS generation failed'));
+                }
+              } else if (data.msg === 'process_generating' && data.output?.data?.[0]?.url) {
+                // Streaming intermediate result — use it
+                es.close();
+                clearTimeout(timeout);
+                resolve(data.output.data[0].url);
+              } else if (data.msg === 'close_stream') {
+                es.close();
+                clearTimeout(timeout);
+              }
+            } catch(e) { /* ignore parse errors from SSE heartbeats */ }
+          };
+          
+          es.onerror = () => {
+            es.close();
+            clearTimeout(timeout);
+            reject(new Error('SSE connection error'));
+          };
+        });
+      }
+      
+      // Generate audio for a text chunk via HF Space API
+      // Returns AudioBuffer ready for playback
+      async _generateChunk(text, voice, speed) {
+        // New session per request to avoid SSE message conflicts
+        const session = Math.random().toString(36).slice(2, 12);
+        
+        // Join the Gradio queue
+        const joinRes = await fetch(HF_SPACE + '/gradio_api/queue/join', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            data: [text, voice || 'af_heart', speed || 1.0, false], // false = CPU (reliable for anon)
+            fn_index: 4,
+            session_hash: session,
+          }),
+        });
+        
+        if (!joinRes.ok) throw new Error('Failed to join TTS queue: ' + joinRes.status);
+        const { event_id } = await joinRes.json();
+        
+        // Wait for SSE result (audio URL)
+        const audioUrl = await new Promise((resolve, reject) => {
+          const es = new EventSource(HF_SPACE + '/gradio_api/queue/data?session_hash=' + session);
+          const timeout = setTimeout(() => { es.close(); reject(new Error('TTS timeout')); }, 60000);
+          
+          es.onmessage = (msg) => {
+            try {
+              const data = JSON.parse(msg.data);
+              if (data.msg === 'process_completed') {
+                es.close();
+                clearTimeout(timeout);
+                if (data.success && data.output?.data?.[0]?.url) {
+                  resolve(data.output.data[0].url);
+                } else if (data.success && data.output?.data?.[0]?.path) {
+                  resolve(HF_SPACE + '/gradio_api/file=' + data.output.data[0].path);
+                } else {
+                  reject(new Error('TTS failed: ' + JSON.stringify(data.output)));
+                }
+              } else if (data.msg === 'close_stream') {
+                es.close();
+                clearTimeout(timeout);
+              }
+            } catch(e) {}
+          };
+          es.onerror = () => { es.close(); clearTimeout(timeout); reject(new Error('SSE error')); };
+        });
+        
+        // Fetch the WAV file and decode to AudioBuffer
+        const wavRes = await fetch(audioUrl);
+        if (!wavRes.ok) throw new Error('Failed to fetch audio: ' + wavRes.status);
+        const arrayBuf = await wavRes.arrayBuffer();
         return await this.audioContext.decodeAudioData(arrayBuf);
       }
       
       // ============================================================
-      // SENTENCE-LEVEL PLAYBACK: predict() per sentence + audio queue
-      // Piper's VITS model is fast on CPU/WASM — typically <500ms
-      // per sentence even on mobile, so this streams smoothly.
+      // SENTENCE-LEVEL PLAYBACK: API call per sentence + audio queue
       // ============================================================
       
       async streamParagraph(text, voice, speed, onFirst, onDone) {
         this._resetQueue();
         this._cancelled = false;
         this._onDone = onDone;
-        this._currentSpeed = speed || 1.0;
         this._estDur = (text.split(/\s+/).length / 150) * 60 / (speed || 1);
         
         let n = 0, firstSent = false;
         
         try {
-          // Sentence splitting — same approach as before
+          // Sentence splitting — same approach as original
           const sentences = text.match(/[^.!?]*[.!?]+["'"'\u201D\u2019]?\s*/g) || [text];
-          // Merge short fragments for more natural delivery
           const chunks = [];
           for (const s of sentences) {
             if (chunks.length > 0 && s.trim().length < 30) {
@@ -1288,11 +1343,8 @@
             const trimmed = chunk.trim();
             if (trimmed.length < 2) continue;
             
-            // Piper predict() returns WAV Blob
-            const wavBlob = await this.session.predict(trimmed);
+            const buf = await this._generateChunk(trimmed, voice, speed);
             if (this._cancelled) break;
-            
-            const buf = await this._wavToBuffer(wavBlob);
             if (!buf || buf.length === 0) { console.warn('[TTS] Empty result, skipping'); continue; }
             
             n++;
@@ -1301,7 +1353,6 @@
             
             if (!firstSent) { firstSent = true; if (onFirst) onFirst(); }
             
-            // Micro-yield — keeps UI responsive between generate() calls
             await new Promise(r => setTimeout(r, 0));
           }
         } catch(e) {
@@ -1315,7 +1366,7 @@
       
       _enq(buf) {
         this._queue.push(buf);
-        this._totalDur += buf.duration / (this._currentSpeed || 1);
+        this._totalDur += buf.duration;
         if (!this._playing) this._next();
       }
       
@@ -1330,11 +1381,8 @@
         if (this.audioContext.state === 'suspended') await this.audioContext.resume();
         const src = this.audioContext.createBufferSource();
         src.buffer = buf;
-        // Speed control via playbackRate (Piper doesn't have a per-call speed param)
-        src.playbackRate.value = this._currentSpeed || 1.0;
         src.connect(this.gainNode);
-        const effectiveDur = buf.duration / (this._currentSpeed || 1);
-        src.onended = () => { this.currentSource = null; this._playedDur += effectiveDur; this._next(); };
+        src.onended = () => { this.currentSource = null; this._playedDur += buf.duration; this._next(); };
         src.start();
         this.currentSource = src;
         this._chunkStart = this.audioContext.currentTime;
@@ -1361,8 +1409,7 @@
         if (this._preCache[key] || this._prePromises[key]) return;
         this._prePromises[key] = (async () => {
           try {
-            const wavBlob = await this.session.predict(text);
-            const buf = await this._wavToBuffer(wavBlob);
+            const buf = await this._generateChunk(text, voice, speed);
             if (buf) {
               this._preCache[key] = buf;
               console.log('[TTS] Pre-gen: ' + key + ' (' + buf.duration.toFixed(1) + 's)');
@@ -1384,13 +1431,12 @@
       // Play a pre-generated buffer directly
       async playBuffer(buf, onEnd) {
         this._resetQueue();
-        this._totalDur = buf.duration / (this._currentSpeed || 1);
-        this._estDur = this._totalDur;
+        this._totalDur = buf.duration;
+        this._estDur = buf.duration;
         this._allEnqueued = true;
         if (this.audioContext.state === 'suspended') await this.audioContext.resume();
         const src = this.audioContext.createBufferSource();
         src.buffer = buf;
-        src.playbackRate.value = this._currentSpeed || 1.0;
         src.connect(this.gainNode);
         src.onended = () => { this.currentSource = null; if (onEnd) onEnd(); };
         src.start();
@@ -1414,12 +1460,11 @@
       }
       
       setVolume(v) { if (this.gainNode) this.gainNode.gain.value = Math.max(0, Math.min(1, v)); }
-      setSpeed(s) { this._currentSpeed = s || 1.0; }
-      destroy() { this.fullStop(); if (this.audioContext) this.audioContext.close().catch(() => {}); this.session = null; this.status = 'idle'; }
+      destroy() { this.fullStop(); if (this.audioContext) this.audioContext.close().catch(() => {}); this.status = 'idle'; }
     }
     
     // Singleton instance
-    const ttsManager = new PiperTTSManager();
+    const kokoroManager = new KokoroTTSManager();
 
 
 
@@ -1552,9 +1597,9 @@
       const [listenParagraphIdx, setListenParagraphIdx] = useState(0);
       const [isListenPlaying, setIsListenPlaying] = useState(false);
       const [listenSpeed, setListenSpeed] = useState(savedPrefs.current.listenSpeed || 1.0);
-      const [selectedVoice, setSelectedVoice] = useState(savedPrefs.current.voice || 'en_US-lessac-medium');
-      const [dialogueVoice, setDialogueVoice] = useState(null);
-      const [dialogueSplitEnabled, setDialogueSplitEnabled] = useState(false);
+      const [selectedVoice, setSelectedVoice] = useState(savedPrefs.current.voice || 'af_heart');
+      const [dialogueVoice, setDialogueVoice] = useState(savedPrefs.current.dialogueVoice || 'af_bella');
+      const [dialogueSplitEnabled, setDialogueSplitEnabled] = useState(savedPrefs.current.dialogueSplit || false);
       const [modelStatus, setModelStatus] = useState('idle');
       const [modelLoadProgress, setModelLoadProgress] = useState(0);
       const [listenAudioProgress, setListenAudioProgress] = useState(0);
@@ -1786,7 +1831,7 @@
           sleepTimerRef.current = setTimeout(() => {
             setIsPlaying(false);
             setIsListenPlaying(false);
-            ttsManager.fullStop();
+            kokoroManager.fullStop();
             setSleepMinutes(0);
             setSleepEndTime(null);
           }, sleepMinutes * 60000);
@@ -2037,22 +2082,21 @@
           if (!para || cancelled) return;
           
           setIsGenerating(true);
-          ttsManager.setSpeed(listenSpeed); // Apply current speed setting
           const paraKey = chapterIndex + ':' + listenParagraphIdx;
           
           try {
             // Check for pre-generated buffer first (instant playback)
-            const pregenBuffer = await ttsManager.getPregen(paraKey);
+            const pregenBuffer = await kokoroManager.getPregen(paraKey);
             
             if (pregenBuffer) {
               console.log('[TTS] Playing pre-gen for para ' + (listenParagraphIdx + 1));
               setIsGenerating(false);
-              ttsManager.usePregen(paraKey);
-              await ttsManager.playBuffer(pregenBuffer, () => { advanceParagraph(); });
+              kokoroManager.usePregen(paraKey);
+              await kokoroManager.playBuffer(pregenBuffer, () => { advanceParagraph(); });
             } else {
               // Stream: generates sentence-by-sentence, plays each as it arrives
               console.log('[TTS] Streaming para ' + (listenParagraphIdx + 1) + '/' + paragraphRanges.length);
-              await ttsManager.streamParagraph(
+              await kokoroManager.streamParagraph(
                 para.text, selectedVoice, listenSpeed,
                 () => { if (!cancelled) setIsGenerating(false); }, // onFirstAudio
                 () => { advanceParagraph(); }, // onAllDone
@@ -2064,7 +2108,7 @@
               const futureIdx = listenParagraphIdx + ahead;
               if (futureIdx < paragraphRanges.length && !cancelled) {
                 const futureKey = chapterIndex + ':' + futureIdx;
-                ttsManager.pregenerate(futureKey, paragraphRanges[futureIdx].text, selectedVoice, listenSpeed);
+                kokoroManager.pregenerate(futureKey, paragraphRanges[futureIdx].text, selectedVoice, listenSpeed);
               }
             }
             
@@ -2072,7 +2116,7 @@
             if (book) {
               updateMediaSession(book.title, book.chapters[chapterIndex]?.title, {
                 play: () => setIsListenPlaying(true),
-                pause: () => { setIsListenPlaying(false); ttsManager.pause(); },
+                pause: () => { setIsListenPlaying(false); kokoroManager.pause(); },
                 prev: () => setListenParagraphIdx(p => Math.max(0, p - 1)),
                 next: () => setListenParagraphIdx(p => Math.min(paragraphRanges.length - 1, p + 1)),
               });
@@ -2088,26 +2132,10 @@
         
         return () => {
           cancelled = true;
-          ttsManager.fullStop();
+          kokoroManager.fullStop();
         };
       }, [mode, isListenPlaying, listenParagraphIdx, modelStatus, paragraphRanges, selectedVoice, listenSpeed, book, chapterIndex, triggerChapterSplash]);
       
-      // Reset model when voice changes (Piper needs to reload for a different voice)
-      useEffect(() => {
-        if (modelStatus === 'ready') {
-          // Voice changed while model was loaded — need to reload
-          ttsManager.fullStop();
-          // Reset the piper-tts-web singleton so next init() creates a fresh session
-          if (ttsManager.piperLib && ttsManager.piperLib.TtsSession) {
-            ttsManager.piperLib.TtsSession._instance = null;
-          }
-          ttsManager.session = null;
-          ttsManager.status = 'idle';
-          setModelStatus('idle');
-          setIsListenPlaying(false);
-        }
-      }, [selectedVoice]);
-
       // Track audio progress for paragraph highlight
       useEffect(() => {
         if (mode !== 'listen' || !isListenPlaying) {
@@ -2116,7 +2144,7 @@
         }
         
         listenProgressRef.current = setInterval(() => {
-          setListenAudioProgress(ttsManager.getProgress());
+          setListenAudioProgress(kokoroManager.getProgress());
         }, 100);
         
         return () => { if (listenProgressRef.current) clearInterval(listenProgressRef.current); };
@@ -2148,7 +2176,7 @@
         setLoadError(null);
         setIsPlaying(false);
         setIsListenPlaying(false);
-        ttsManager.fullStop();
+        kokoroManager.fullStop();
         
         try {
           const parsed = await parseEPUB(file);
@@ -2171,15 +2199,15 @@
         if (mode === 'listen') {
           if (isListenPlaying) {
             setIsListenPlaying(false);
-            ttsManager.pause();
+            kokoroManager.pause();
           } else {
             // If model not loaded, start loading
             if (modelStatus !== 'ready') {
-              handleInitPiper();
+              handleInitKokoro();
               return;
             }
             setIsListenPlaying(true);
-            ttsManager.resume();
+            kokoroManager.resume();
           }
           return;
         }
@@ -2196,27 +2224,27 @@
       const handleReset = () => {
         setIsPlaying(false);
         setIsListenPlaying(false);
-        ttsManager.fullStop();
+        kokoroManager.fullStop();
         setCurrentIndex(0);
         setListenParagraphIdx(0);
         setInDialogue(false);
       };
       
-      const handleInitPiper = async () => {
+      const handleInitKokoro = async () => {
         if (modelStatus === 'loading' || modelStatus === 'ready') return;
         
         setModelStatus('loading');
         setModelLoadProgress(0);
         
         try {
-          ttsManager.onStatusChange = (status, progress) => {
+          kokoroManager.onStatusChange = (status, progress) => {
             setModelStatus(status);
             setModelLoadProgress(progress);
           };
           
-          await ttsManager.init((progress) => {
+          await kokoroManager.init((progress) => {
             setModelLoadProgress(progress);
-          }, selectedVoice);
+          });
           
           setModelStatus('ready');
           // Auto-start playback after model loads
@@ -2231,7 +2259,7 @@
         // Stop everything first
         setIsPlaying(false);
         setIsListenPlaying(false);
-        ttsManager.fullStop();
+        kokoroManager.fullStop();
         
         if (mode === 'rsvp') {
           // Switching to listen mode
@@ -2272,7 +2300,7 @@
         if (mode === 'listen') {
           setListenParagraphIdx(p => Math.max(0, p - 1));
           setIsListenPlaying(false);
-          ttsManager.fullStop();
+          kokoroManager.fullStop();
           if (hapticEnabled) haptic(10);
           showNavFeedback('back');
           return;
@@ -2293,7 +2321,7 @@
         if (mode === 'listen') {
           setListenParagraphIdx(p => Math.min(paragraphRanges.length - 1, p + 1));
           setIsListenPlaying(false);
-          ttsManager.fullStop();
+          kokoroManager.fullStop();
           if (hapticEnabled) haptic(10);
           showNavFeedback('forward');
           return;
@@ -2313,7 +2341,7 @@
         
         setIsPlaying(false);
         setIsListenPlaying(false);
-        ttsManager.fullStop();
+        kokoroManager.fullStop();
         setChapterIndex(newIndex);
         setCurrentIndex(0);
         setListenParagraphIdx(0);
@@ -2348,7 +2376,7 @@
         setCurrentIndex(0);
         setIsPlaying(false);
         setIsListenPlaying(false);
-        ttsManager.fullStop();
+        kokoroManager.fullStop();
         setInDialogue(false);
         setShowChapterSplash(false);
         setListenParagraphIdx(0);
@@ -2765,12 +2793,12 @@
         if (modelStatus !== 'loading') return null;
         return e('div', { className: 'model-loading-overlay' }, [
           e('div', { key: 'spin', style: { width: '40px', height: '40px', border: '3px solid rgba(255,255,255,0.1)', borderTopColor: '#ef4444', borderRadius: '50%', animation: 'spin 1s linear infinite' } }),
-          e('div', { key: 'title', style: { fontSize: '1.125rem', fontWeight: '600', color: '#fff' } }, 'Loading Voice Model'),
+          e('div', { key: 'title', style: { fontSize: '1.125rem', fontWeight: '600', color: '#fff' } }, 'Connecting to Voice Server'),
           e('div', { key: 'sub', style: { fontSize: '0.8125rem', color: 'rgba(255,255,255,0.5)' } },
-            modelLoadProgress > 0 ? (Math.round(modelLoadProgress) + '%') : 'Initializing...'),
+            modelLoadProgress > 50 ? 'Almost ready...' : modelLoadProgress > 10 ? 'Waking up server...' : 'Connecting...'),
           e('div', { key: 'bar', className: 'model-progress-bar' },
             e('div', { className: 'model-progress-fill', style: { width: modelLoadProgress + '%' } })),
-          e('div', { key: 'note', style: { fontSize: '0.6875rem', color: 'rgba(255,255,255,0.3)', marginTop: '0.5rem' } }, 'One-time download \u2022 Cached for offline use'),
+          e('div', { key: 'note', style: { fontSize: '0.6875rem', color: 'rgba(255,255,255,0.3)', marginTop: '0.5rem' } }, 'Free server \u2022 First connect may take ~30s'),
         ]);
       };
 
@@ -2788,7 +2816,7 @@
             
             // Voice settings
             e('div', { key: 'voice', className: 'settings-section' }, [
-              e('div', { key: 'l', className: 'settings-label' }, 'Voice (Listen Mode)'),
+              e('div', { key: 'l', className: 'settings-label' }, 'Voices (Listen Mode)'),
               e('div', { key: 'narrator', className: 'settings-row' }, [
                 e('span', { key: 'rl', className: 'settings-row-label' }, 'Voice'),
                 e('select', {
@@ -2796,12 +2824,27 @@
                   className: 'settings-select',
                   value: selectedVoice,
                   onChange: (ev) => setSelectedVoice(ev.target.value),
-                }, Object.entries(PIPER_VOICES).map(([id, v]) =>
-                  e('option', { key: id, value: id }, v.label + ' ' + (v.gender === 'F' ? '\u2640' : '\u2642'))
+                }, KOKORO_VOICES.map(v =>
+                  e('option', { key: v.id, value: v.id }, v.name + ' (' + v.rating + ') ' + (v.gender === 'F' ? '\u2640' : '\u2642'))
                 )),
               ]),
-              modelStatus === 'ready' && e('div', { key: 'voicenote', style: { fontSize: '0.6875rem', color: theme.warning, marginTop: '0.25rem' } },
-                'Changing voice requires reloading the model'),
+              e('div', { key: 'splitToggle', className: 'settings-row' }, [
+                e('span', { key: 'rl', className: 'settings-row-label' }, 'Dialogue Voice Splitting'),
+                e('button', { key: 'tog', className: 'settings-toggle ' + (dialogueSplitEnabled ? 'active' : ''), onClick: () => setDialogueSplitEnabled(!dialogueSplitEnabled) }),
+              ]),
+              dialogueSplitEnabled && e('div', { key: 'dialogue', className: 'settings-row' }, [
+                e('span', { key: 'rl', className: 'settings-row-label' }, 'Dialogue Voice'),
+                e('select', {
+                  key: 'sel',
+                  className: 'settings-select',
+                  value: dialogueVoice,
+                  onChange: (ev) => setDialogueVoice(ev.target.value),
+                }, KOKORO_VOICES.map(v =>
+                  e('option', { key: v.id, value: v.id }, v.name + ' (' + v.rating + ') ' + (v.gender === 'F' ? '\u2640' : '\u2642'))
+                )),
+              ]),
+              dialogueSplitEnabled && e('div', { key: 'voicenote', style: { fontSize: '0.6875rem', color: theme.muted, marginTop: '0.25rem' } },
+                'Slower generation — uses separate voice for quoted text'),
               e('div', { key: 'speed', className: 'settings-row' }, [
                 e('span', { key: 'sl', className: 'settings-row-label' }, 'Listen Speed: ' + listenSpeed.toFixed(1) + 'x'),
                 e('input', {
@@ -2811,7 +2854,7 @@
                   style: { width: '8rem', height: '4px', borderRadius: '2px', backgroundColor: theme.cardBorder, cursor: 'pointer' },
                 }),
               ]),
-              modelStatus === 'ready' && e('div', { key: 'status', style: { fontSize: '0.6875rem', color: theme.muted, marginTop: '0.25rem' } }, '\u2713 Voice model loaded (Piper TTS)'),
+              modelStatus === 'ready' && e('div', { key: 'status', style: { fontSize: '0.6875rem', color: theme.muted, marginTop: '0.25rem' } }, '\u2713 Connected to voice server'),
             ]),
             
             // Theme
