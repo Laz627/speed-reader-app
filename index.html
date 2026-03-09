@@ -1478,7 +1478,8 @@
         this._preCache = {};
         this._prePromises = {};
         
-        this.HF_BASE = 'https://hexgrad-kokoro-tts.hf.space';
+        // Your duplicated Space — API is open, CPU-only, free tier
+        this.HF_BASE = 'https://laz627-kokoro-tts.hf.space';
       }
       
       // ============================================================
@@ -1502,57 +1503,27 @@
           if (this.onStatusChange) this.onStatusChange('loading', 30);
           if (onProgress) onProgress(30);
           
-          // Quick connectivity test — join queue with a short phrase
-          debugLog('[HF] Testing connectivity to HF Space...');
-          const testSession = 'init_' + Math.random().toString(36).slice(2, 8);
-          const testRes = await fetch(this.HF_BASE + '/gradio_api/queue/join', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              data: ['Test.', 'af_heart', 1.0, false],
-              fn_index: 4,
-              session_hash: testSession
-            })
-          });
+          // Quick connectivity test — hit the API info endpoint
+          debugLog('[HF] Testing connectivity to ' + this.HF_BASE + '...');
+          const infoRes = await fetch(this.HF_BASE + '/gradio_api/info');
+          debugLog('[HF] API info: HTTP ' + infoRes.status);
+          if (!infoRes.ok) throw new Error('HF Space returned HTTP ' + infoRes.status);
           
-          debugLog('[HF] Connectivity test: HTTP ' + testRes.status);
-          if (!testRes.ok) throw new Error('HF Space returned HTTP ' + testRes.status);
+          if (this.onStatusChange) this.onStatusChange('loading', 70);
+          if (onProgress) onProgress(70);
           
-          const testData = await testRes.json();
-          debugLog('[HF] Queue join OK, event_id: ' + (testData.event_id || 'none'));
+          // Verify /predict endpoint exists
+          const info = await infoRes.json();
+          const hasPredict = info.named_endpoints && info.named_endpoints['/predict'];
+          debugLog('[HF] /predict endpoint available: ' + !!hasPredict);
+          if (!hasPredict) throw new Error('Space missing /predict endpoint — is it fully loaded?');
           
-          if (this.onStatusChange) this.onStatusChange('loading', 80);
-          if (onProgress) onProgress(80);
-          
-          // Read the test result to confirm full pipeline works
-          debugLog('[HF] Reading test result...');
-          const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), 15000);
-          
-          try {
-            const dataRes = await fetch(
-              this.HF_BASE + '/gradio_api/queue/data?session_hash=' + testSession,
-              { signal: controller.signal }
-            );
-            clearTimeout(timeout);
-            debugLog('[HF] Test data response: HTTP ' + dataRes.status + ', content-type: ' + (dataRes.headers.get('content-type') || 'none'));
-            
-            if (dataRes.ok) {
-              const sseText = await dataRes.text();
-              debugLog('[HF] Test SSE length: ' + sseText.length + ' chars');
-              const hasCompleted = sseText.includes('process_completed');
-              debugLog('[HF] Test completed: ' + hasCompleted);
-            }
-          } catch(e) {
-            clearTimeout(timeout);
-            // Non-fatal — connectivity test result read failed, but queue/join worked
-            debugLog('[HF] Test result read failed (non-fatal): ' + e.message);
-          }
+          if (this.onStatusChange) this.onStatusChange('loading', 100);
+          if (onProgress) onProgress(100);
           
           this.status = 'ready';
           if (this.onStatusChange) this.onStatusChange('ready', 100);
-          if (onProgress) onProgress(100);
-          debugLog('[HF] Ready — server-side Kokoro TTS via HF Space');
+          debugLog('[HF] Ready — server-side Kokoro TTS via ' + this.HF_BASE);
         } catch (err) {
           debugLog('[HF] ❌ Init failed: ' + err.message);
           this.status = 'error';
@@ -1562,122 +1533,115 @@
       }
       
       // ============================================================
-      // CORE: Generate audio for a single text chunk via HF Space API
-      // Steps: queue/join → queue/data (SSE) → fetch WAV → decode
+      // CORE: Generate audio via the /call/predict REST API
+      //
+      // This is Gradio's simpler REST API (vs the queue/join SSE approach):
+      //   1. POST /gradio_api/call/predict → {"event_id": "..."}
+      //   2. GET  /gradio_api/call/predict/{event_id} → SSE with "event: complete\ndata: [{url}]"
+      //   3. GET  audio URL → WAV file
+      //
+      // Much more reliable cross-origin than the SSE queue approach.
       // ============================================================
       
       async _generateSentence(text, voice, speed) {
-        const sessionHash = 'sr_' + Math.random().toString(36).slice(2, 10);
         const trimmed = text.trim();
         if (trimmed.length < 2) return null;
         
-        // Step 1: Join queue
-        debugLog('[HF] → POST queue/join: "' + trimmed.substring(0, 50) + (trimmed.length > 50 ? '...' : '') + '"');
+        // Step 1: Submit to /call/predict
+        debugLog('[HF] → POST /call/predict: "' + trimmed.substring(0, 50) + (trimmed.length > 50 ? '...' : '') + '"');
         
-        let joinRes;
+        let callRes;
         try {
-          joinRes = await fetch(this.HF_BASE + '/gradio_api/queue/join', {
+          callRes = await fetch(this.HF_BASE + '/gradio_api/call/predict', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-              data: [trimmed, voice || 'af_heart', speed || 1.0, false],
-              fn_index: 4,
-              session_hash: sessionHash
+              data: [trimmed, voice || 'af_heart', speed || 1.0]
             })
           });
         } catch(fetchErr) {
-          debugLog('[HF] ❌ queue/join fetch error: ' + fetchErr.message);
-          throw new Error('queue/join network error: ' + fetchErr.message);
+          debugLog('[HF] ❌ /call/predict POST error: ' + fetchErr.message);
+          throw new Error('Network error: ' + fetchErr.message);
         }
         
-        debugLog('[HF] ← queue/join: HTTP ' + joinRes.status);
-        if (!joinRes.ok) {
-          const errText = await joinRes.text().catch(() => '(no body)');
-          debugLog('[HF] ❌ queue/join error body: ' + errText.substring(0, 200));
-          throw new Error('Queue join HTTP ' + joinRes.status + ': ' + errText.substring(0, 100));
+        debugLog('[HF] ← POST: HTTP ' + callRes.status);
+        if (!callRes.ok) {
+          const errText = await callRes.text().catch(() => '(no body)');
+          debugLog('[HF] ❌ POST error body: ' + errText.substring(0, 200));
+          throw new Error('API returned HTTP ' + callRes.status + ': ' + errText.substring(0, 100));
         }
         
-        const joinData = await joinRes.json();
-        debugLog('[HF] ← event_id: ' + (joinData.event_id || 'none'));
+        const callData = await callRes.json();
+        const eventId = callData.event_id;
+        debugLog('[HF] ← event_id: ' + eventId);
         
-        // Step 2: Read SSE result with timeout
-        debugLog('[HF] → GET queue/data (session: ' + sessionHash + ')');
+        if (!eventId) throw new Error('No event_id returned from API');
+        
+        // Step 2: GET the result (SSE stream — but usually just one "complete" event)
+        debugLog('[HF] → GET /call/predict/' + eventId);
         const controller = new AbortController();
         const timeout = setTimeout(() => {
-          debugLog('[HF] ⏰ queue/data timeout (30s), aborting');
+          debugLog('[HF] ⏰ Result timeout (60s), aborting');
           controller.abort();
-        }, 30000);
+        }, 60000); // 60s timeout for CPU inference
         
-        let sseText;
+        let resultText;
         try {
-          const dataRes = await fetch(
-            this.HF_BASE + '/gradio_api/queue/data?session_hash=' + sessionHash,
+          const resultRes = await fetch(
+            this.HF_BASE + '/gradio_api/call/predict/' + eventId,
             { signal: controller.signal }
           );
           clearTimeout(timeout);
-          debugLog('[HF] ← queue/data: HTTP ' + dataRes.status + ', content-type: ' + (dataRes.headers.get('content-type') || 'none'));
+          debugLog('[HF] ← GET: HTTP ' + resultRes.status);
           
-          if (!dataRes.ok) {
-            const errText = await dataRes.text().catch(() => '(no body)');
-            debugLog('[HF] ❌ queue/data error: ' + errText.substring(0, 200));
-            throw new Error('Queue data HTTP ' + dataRes.status);
+          if (!resultRes.ok) {
+            const errText = await resultRes.text().catch(() => '(no body)');
+            throw new Error('Result fetch HTTP ' + resultRes.status + ': ' + errText.substring(0, 100));
           }
           
-          sseText = await dataRes.text();
-          debugLog('[HF] ← SSE: ' + sseText.length + ' chars');
+          resultText = await resultRes.text();
+          debugLog('[HF] ← Result: ' + resultText.length + ' chars');
         } catch(e) {
           clearTimeout(timeout);
-          if (e.name === 'AbortError') {
-            throw new Error('queue/data timed out after 30s');
-          }
-          debugLog('[HF] ❌ queue/data error: ' + e.message);
+          if (e.name === 'AbortError') throw new Error('Generation timed out after 60s');
           throw e;
         }
         
-        // Step 3: Parse SSE for process_completed
+        // Step 3: Parse the SSE result for the audio URL
+        // Format: "event: complete\ndata: [{url, path, ...}]"
         let audioUrl = null;
-        const lines = sseText.split('\n');
-        let foundMsgs = [];
         
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
-          try {
-            const parsed = JSON.parse(line.slice(6));
-            foundMsgs.push(parsed.msg || 'unknown');
-            
-            if (parsed.msg === 'process_completed') {
-              if (parsed.output?.error) {
-                debugLog('[HF] ❌ Space error: ' + parsed.output.error);
-                throw new Error('HF Space processing error: ' + parsed.output.error);
-              }
-              if (parsed.output?.data) {
-                const fileInfo = parsed.output.data[0];
-                debugLog('[HF] output.data[0] type: ' + typeof fileInfo + ', keys: ' + (fileInfo ? Object.keys(fileInfo).join(',') : 'null'));
-                
+        const lines = resultText.split('\n');
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines[i];
+          if (line.startsWith('data: ')) {
+            try {
+              const parsed = JSON.parse(line.slice(6));
+              // parsed is an array: [{path, url, ...}]
+              if (Array.isArray(parsed) && parsed.length > 0) {
+                const fileInfo = parsed[0];
                 if (fileInfo?.url) {
                   audioUrl = fileInfo.url;
                 } else if (fileInfo?.path) {
                   audioUrl = this.HF_BASE + '/gradio_api/file=' + fileInfo.path;
-                } else if (typeof fileInfo === 'string' && fileInfo.includes('/')) {
-                  // Sometimes Gradio returns just a path string
-                  audioUrl = this.HF_BASE + '/gradio_api/file=' + fileInfo;
                 }
               }
+            } catch(e) {
+              // Check for error event
+              if (lines[i - 1]?.includes('event: error')) {
+                debugLog('[HF] ❌ Server error: ' + line.slice(6));
+                throw new Error('Server error: ' + line.slice(6).substring(0, 100));
+              }
             }
-          } catch(e) {
-            if (e.message.includes('HF Space')) throw e;
-            // Not valid JSON, skip
           }
         }
         
-        debugLog('[HF] SSE messages found: ' + foundMsgs.join(', '));
-        
         if (!audioUrl) {
-          debugLog('[HF] ❌ No audio URL. First 500 chars of SSE:\n' + sseText.substring(0, 500));
-          throw new Error('No audio URL found in SSE response (msgs: ' + foundMsgs.join(',') + ')');
+          debugLog('[HF] ❌ No audio URL. Response:\n' + resultText.substring(0, 500));
+          throw new Error('No audio URL in response');
         }
         
-        debugLog('[HF] Audio URL: ' + audioUrl.substring(0, 100));
+        debugLog('[HF] Audio URL: ' + audioUrl.substring(0, 80) + '...');
         
         // Step 4: Fetch the WAV audio file
         let audioRes;
@@ -1685,37 +1649,30 @@
           audioRes = await fetch(audioUrl);
         } catch(fetchErr) {
           debugLog('[HF] ❌ Audio fetch error: ' + fetchErr.message);
-          throw new Error('Audio fetch network error: ' + fetchErr.message);
+          throw new Error('Audio download failed: ' + fetchErr.message);
         }
         
-        debugLog('[HF] ← audio: HTTP ' + audioRes.status + ', content-type: ' + (audioRes.headers.get('content-type') || 'none') + ', size: ' + (audioRes.headers.get('content-length') || '?'));
-        
-        if (!audioRes.ok) throw new Error('Audio fetch HTTP ' + audioRes.status);
+        debugLog('[HF] ← audio: HTTP ' + audioRes.status + ', size: ' + (audioRes.headers.get('content-length') || '?'));
+        if (!audioRes.ok) throw new Error('Audio download HTTP ' + audioRes.status);
         
         const arrayBuf = await audioRes.arrayBuffer();
-        debugLog('[HF] Audio buffer: ' + arrayBuf.byteLength + ' bytes');
-        
-        if (arrayBuf.byteLength < 100) {
-          debugLog('[HF] ⚠️ Audio buffer suspiciously small');
-          throw new Error('Audio response too small: ' + arrayBuf.byteLength + ' bytes');
-        }
+        if (arrayBuf.byteLength < 100) throw new Error('Audio too small: ' + arrayBuf.byteLength + 'B');
         
         // Step 5: Decode to AudioBuffer
         let audioBuf;
         try {
-          audioBuf = await this.audioContext.decodeAudioData(arrayBuf.slice(0)); // slice(0) copies — some browsers consume the buffer
+          audioBuf = await this.audioContext.decodeAudioData(arrayBuf.slice(0));
         } catch(decodeErr) {
           debugLog('[HF] ❌ decodeAudioData failed: ' + decodeErr.message);
           throw new Error('Audio decode failed: ' + decodeErr.message);
         }
         
-        debugLog('[HF] ✓ Decoded: ' + audioBuf.duration.toFixed(1) + 's, ' + audioBuf.sampleRate + 'Hz');
+        debugLog('[HF] ✓ ' + audioBuf.duration.toFixed(1) + 's, ' + audioBuf.sampleRate + 'Hz');
         return audioBuf;
       }
       
       // ============================================================
-      // SENTENCE-LEVEL PLAYBACK: _generateSentence per chunk + audio queue
-      // Same sentence splitting as KokoroTTSManager for consistency
+      // SENTENCE-LEVEL PLAYBACK
       // ============================================================
       
       async streamParagraph(text, voice, speed, onFirst, onDone) {
@@ -1727,7 +1684,6 @@
         let n = 0, firstSent = false;
         
         try {
-          // Same sentence splitting as KokoroTTSManager
           const sentences = text.match(/[^.!?]*[.!?]+["'"'\u201D\u2019]?\s*/g) || [text];
           const chunks = [];
           for (const s of sentences) {
@@ -1747,7 +1703,7 @@
             
             const buf = await this._generateSentence(trimmed, voice, speed);
             if (this._cancelled) break;
-            if (!buf) { debugLog('[HF] Empty result, skipping'); continue; }
+            if (!buf) continue;
             
             n++;
             debugLog('[HF] Chunk ' + n + '/' + chunks.length + ': ' + buf.duration.toFixed(1) + 's');
@@ -1809,7 +1765,7 @@
       }
       
       // ============================================================
-      // PRE-GENERATION (same interface as KokoroTTSManager)
+      // PRE-GENERATION
       // ============================================================
       
       pregenerate(key, text, voice, speed) {
