@@ -1261,10 +1261,15 @@
         // Detect device
         const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)
           || (navigator.maxTouchPoints > 0 && window.innerWidth < 1024);
+        // Detect best backend. Now that inference runs in a Web Worker
+        // using stream(), WebGPU is safe on mobile — the Worker manages
+        // GPU context properly and stream() handles chunking internally.
         let device = 'wasm', dtype = 'q8';
-        if (!isMobile) {
-          try { if (navigator.gpu && await navigator.gpu.requestAdapter()) { device = 'webgpu'; dtype = 'fp32'; } } catch(e) {}
-        }
+        try {
+          if (navigator.gpu && await navigator.gpu.requestAdapter()) {
+            device = 'webgpu'; dtype = 'fp32';
+          }
+        } catch(e) {}
         console.log('[TTS] Worker init: ' + device + '/' + dtype + (isMobile ? ' (mobile)' : ''));
         
         return new Promise((resolve, reject) => {
