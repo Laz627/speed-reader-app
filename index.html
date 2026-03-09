@@ -1318,50 +1318,63 @@
         this._onDone = onDone;
         this._estDur = (text.split(/\s+/).length / 150) * 60 / (speed || 1);
         
-        let n = 0, firstSent = false;
-        
         try {
-          // Manual sentence splitting + generate() per sentence.
-          // tts.stream() hangs on mobile Chrome. generate() works everywhere.
-          // With q8+WebGPU, each generate() is ~150-600ms — fast enough
-          // for seamless queue-based playback without UI freezing.
-          const sentences = text.match(/[^.!?]*[.!?]+["'"'\u201D\u2019]?\s*/g) || [text];
-          // Merge short fragments
-          const chunks = [];
-          for (const s of sentences) {
-            if (chunks.length > 0 && s.trim().length < 30) {
-              chunks[chunks.length - 1] += s;
-            } else if (s.trim().length > 0) {
-              chunks.push(s);
-            }
-          }
-          
-          for (const chunk of chunks) {
-            if (this._cancelled) break;
-            const trimmed = chunk.trim();
-            if (trimmed.length < 2) continue;
+          if (IS_MOBILE) {
+            // Mobile: single generate() call for whole paragraph.
+            // Avoids per-sentence overhead, lets Kokoro optimize internally.
+            // Longer wait before first audio, but zero intra-paragraph gaps.
+            const trimmed = text.trim();
+            if (trimmed.length < 2) { if (onDone) onDone(); return; }
             
+            debugLog('[TTS] Generating paragraph (' + trimmed.length + ' chars)...');
             const result = await this.tts.generate(trimmed, { voice: voice || 'af_heart', speed: speed || 1.0 });
-            if (this._cancelled) break;
+            if (this._cancelled) return;
             
             const buf = this._toBuf(result);
-            if (!buf) { console.warn('[TTS] Empty result, skipping'); continue; }
+            if (!buf) { console.warn('[TTS] Empty result'); if (onDone) onDone(); return; }
             
-            n++;
-            console.log('[TTS] Chunk ' + n + ': ' + buf.duration.toFixed(1) + 's | "' + trimmed.substring(0, 40) + '..."');
+            debugLog('[TTS] Paragraph: ' + buf.duration.toFixed(1) + 's');
             this._enq(buf);
+            if (onFirst) onFirst();
+          } else {
+            // Desktop: sentence-by-sentence for faster time-to-first-audio.
+            // With WebGPU on desktop, each generate() is ~150-600ms.
+            let n = 0, firstSent = false;
+            const sentences = text.match(/[^.!?]*[.!?]+["'"'\u201D\u2019]?\s*/g) || [text];
+            const chunks = [];
+            for (const s of sentences) {
+              if (chunks.length > 0 && s.trim().length < 30) {
+                chunks[chunks.length - 1] += s;
+              } else if (s.trim().length > 0) {
+                chunks.push(s);
+              }
+            }
             
-            if (!firstSent) { firstSent = true; if (onFirst) onFirst(); }
-            
-            // Micro-yield between generate() calls — keeps UI responsive
-            await new Promise(r => setTimeout(r, 0));
+            for (const chunk of chunks) {
+              if (this._cancelled) break;
+              const trimmed = chunk.trim();
+              if (trimmed.length < 2) continue;
+              
+              const result = await this.tts.generate(trimmed, { voice: voice || 'af_heart', speed: speed || 1.0 });
+              if (this._cancelled) break;
+              
+              const buf = this._toBuf(result);
+              if (!buf) { console.warn('[TTS] Empty result, skipping'); continue; }
+              
+              n++;
+              console.log('[TTS] Chunk ' + n + ': ' + buf.duration.toFixed(1) + 's | "' + trimmed.substring(0, 40) + '..."');
+              this._enq(buf);
+              
+              if (!firstSent) { firstSent = true; if (onFirst) onFirst(); }
+              await new Promise(r => setTimeout(r, 0));
+            }
+            console.log('[TTS] Done: ' + n + ' chunks, ' + this._totalDur.toFixed(1) + 's audio');
           }
         } catch(e) {
           if (!this._cancelled) console.error('[TTS] Error:', e);
         }
         
         this._allEnqueued = true;
-        console.log('[TTS] Done: ' + n + ' chunks, ' + this._totalDur.toFixed(1) + 's audio');
         if (!this._playing && this._queue.length === 0 && this._onDone) this._onDone();
       }
       
@@ -2452,11 +2465,15 @@
             }
             
             // Pre-generate next 2 paragraphs while current plays
-            for (let ahead = 1; ahead <= 2; ahead++) {
-              const futureIdx = listenParagraphIdx + ahead;
-              if (futureIdx < paragraphRanges.length && !cancelled) {
-                const futureKey = chapterIndex + ':' + futureIdx;
-                ttsManager.pregenerate(futureKey, paragraphRanges[futureIdx].text, selectedVoice, listenSpeed);
+            // Disabled on mobile: single GPU can't parallelize, pre-gen just
+            // queues behind current sentence and adds latency to everything
+            if (!IS_MOBILE) {
+              for (let ahead = 1; ahead <= 2; ahead++) {
+                const futureIdx = listenParagraphIdx + ahead;
+                if (futureIdx < paragraphRanges.length && !cancelled) {
+                  const futureKey = chapterIndex + ':' + futureIdx;
+                  ttsManager.pregenerate(futureKey, paragraphRanges[futureIdx].text, selectedVoice, listenSpeed);
+                }
               }
             }
             
