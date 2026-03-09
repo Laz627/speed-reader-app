@@ -2072,7 +2072,6 @@
       const saveIntervalRef = useRef(null);
       const splashTimeoutRef = useRef(null);
       const listenProgressRef = useRef(null);
-      const pregenCancelRef = useRef(false); // Separate from effect cleanup — survives paragraph advances
       const touchStartRef = useRef(null);
       
       // Ramp-up counter: counts words since last pause for easing
@@ -2490,15 +2489,59 @@
       // LISTEN MODE PLAYBACK
       // ============================================================
       
-      // Start/stop listen mode audio
-      // Real-time sentence streaming with pre-gen on all platforms
+      // Continuous pre-gen loop — runs independently of playback.
+      // Generates paragraphs sequentially from current position forward.
+      // Completely decoupled from play effect to avoid cleanup/restart issues.
+      const pregenRunningRef = useRef(false);
+      const pregenCancelRef = useRef(false);
+      
+      useEffect(() => {
+        if (mode !== 'listen' || !isListenPlaying || modelStatus !== 'ready' || paragraphRanges.length === 0) {
+          pregenCancelRef.current = true;
+          return;
+        }
+        
+        // Don't start a second loop if one is already running
+        if (pregenRunningRef.current) return;
+        
+        pregenCancelRef.current = false;
+        pregenRunningRef.current = true;
+        
+        (async () => {
+          debugLog('[PREGEN] Starting continuous pre-gen loop');
+          
+          // Generate from paragraph 0 to end of chapter, sequentially
+          for (let i = 0; i < paragraphRanges.length; i++) {
+            if (pregenCancelRef.current) break;
+            
+            const key = chapterIndex + ':' + i;
+            if (ttsManager._preCache[key] || ttsManager._prePromises[key]) continue;
+            
+            ttsManager.pregenerate(key, paragraphRanges[i].text, selectedVoice, listenSpeed);
+            if (ttsManager._prePromises[key]) {
+              await ttsManager._prePromises[key];
+            }
+          }
+          
+          if (!pregenCancelRef.current) {
+            debugLog('[PREGEN] Complete — all ' + paragraphRanges.length + ' paragraphs cached');
+          }
+          pregenRunningRef.current = false;
+        })();
+        
+        return () => {
+          pregenCancelRef.current = true;
+          // pregenRunningRef resets when the async loop exits
+        };
+      }, [mode, isListenPlaying, modelStatus, paragraphRanges, chapterIndex, selectedVoice, listenSpeed]);
+      
+      // Play current paragraph — checks cache first, generates live if not cached
       useEffect(() => {
         if (mode !== 'listen' || !isListenPlaying) return;
         if (modelStatus !== 'ready') return;
         if (paragraphRanges.length === 0) return;
         
         let cancelled = false;
-        pregenCancelRef.current = false; // Allow pre-gen across paragraph advances
         setListenAudioProgress(0);
         
         const advanceParagraph = () => {
@@ -2524,71 +2567,14 @@
         
         async function play() {
           const para = paragraphRanges[listenParagraphIdx];
-          if (!para || cancelled) {
-            debugLog('[PLAY] Skipped: para=' + !!para + ', cancelled=' + cancelled);
-            return;
-          }
-          
-          // === CHAPTER WARMUP ===
-          // On first paragraph of chapter (on mobile), spend up to 45s
-          // pre-generating as many paragraphs as possible before starting playback.
-          // This builds a deep cache so the rolling pre-gen never falls behind.
-          if (IS_MOBILE && listenParagraphIdx === 0 && !ttsManager._preCache[chapterIndex + ':0']) {
-            debugLog('[WARMUP] Starting chapter warmup (45s max)...');
-            setIsGenerating(true);
-            const warmupStart = Date.now();
-            const warmupLimit = 45000; // 45 seconds
-            
-            for (let i = 0; i < Math.min(paragraphRanges.length, 15); i++) {
-              if (cancelled) break;
-              if (Date.now() - warmupStart > warmupLimit) {
-                debugLog('[WARMUP] Time limit reached at para ' + (i + 1));
-                break;
-              }
-              
-              const key = chapterIndex + ':' + i;
-              if (ttsManager._preCache[key] || ttsManager._prePromises[key]) continue;
-              
-              ttsManager.pregenerate(key, paragraphRanges[i].text, selectedVoice, listenSpeed);
-              if (ttsManager._prePromises[key]) {
-                await ttsManager._prePromises[key];
-              }
-              
-              debugLog('[WARMUP] Cached para ' + (i + 1) + ' (' + Math.round((Date.now() - warmupStart) / 1000) + 's elapsed)');
-            }
-            
-            debugLog('[WARMUP] Done — ' + Object.keys(ttsManager._preCache).length + ' paragraphs cached');
-            if (cancelled) return;
-          }
+          if (!para || cancelled) return;
           
           debugLog('[PLAY] Para ' + (listenParagraphIdx + 1) + '/' + paragraphRanges.length + ': "' + para.text.substring(0, 60) + '..."');
           setIsGenerating(true);
           const paraKey = chapterIndex + ':' + listenParagraphIdx;
           
-          // Fire rolling pre-gen — uses pregenCancelRef (persists across paragraph advances)
-          // instead of effect's `cancelled` flag (which resets every paragraph).
-          const firePregen = () => {
-            if (pregenCancelRef.current) return;
-            (async () => {
-              const maxAhead = IS_MOBILE ? 10 : 3;
-              for (let ahead = 1; ahead <= maxAhead; ahead++) {
-                if (pregenCancelRef.current) break;
-                const futureIdx = listenParagraphIdx + ahead;
-                if (futureIdx >= paragraphRanges.length) break;
-                
-                const futureKey = chapterIndex + ':' + futureIdx;
-                if (ttsManager._preCache[futureKey] || ttsManager._prePromises[futureKey]) continue;
-                
-                ttsManager.pregenerate(futureKey, paragraphRanges[futureIdx].text, selectedVoice, listenSpeed);
-                if (ttsManager._prePromises[futureKey]) {
-                  await ttsManager._prePromises[futureKey];
-                }
-              }
-            })();
-          };
-          
           try {
-            // Check for pre-generated buffer first (instant playback)
+            // Check cache (may need to wait if pre-gen is currently generating this paragraph)
             const pregenBuffer = await ttsManager.getPregen(paraKey);
             
             if (pregenBuffer) {
@@ -2596,22 +2582,15 @@
               setIsGenerating(false);
               setListenAudioProgress(0);
               ttsManager.usePregen(paraKey);
-              // Fire pre-gen immediately — GPU is free since we're playing from cache
-              firePregen();
               await new Promise(r => setTimeout(r, 50));
               if (cancelled) return;
               await ttsManager.playBuffer(pregenBuffer, () => { advanceParagraph(); });
             } else {
-              // Generate current paragraph (chunks queue on GPU)
-              // Fire pre-gen too — it queues behind chunks and starts when they finish
+              // Not cached — generate live
               debugLog('[TTS] Streaming para ' + (listenParagraphIdx + 1) + '/' + paragraphRanges.length);
               ttsManager.streamParagraph(
                 para.text, selectedVoice, listenSpeed,
-                () => {
-                  if (!cancelled) setIsGenerating(false);
-                  // Pre-gen fires when first audio chunk arrives — queues behind remaining chunks
-                  firePregen();
-                },
+                () => { if (!cancelled) setIsGenerating(false); },
                 () => { advanceParagraph(); },
               );
             }
@@ -2636,9 +2615,6 @@
         
         return () => {
           cancelled = true;
-          // Stop current playback but PRESERVE pre-gen cache.
-          // fullStop() calls clearPregen() which wipes the cache before
-          // the next play() can read from it. Instead, just stop audio.
           ttsManager._cancelled = true;
           ttsManager.stop();
           ttsManager._queue = [];
@@ -2665,13 +2641,6 @@
         
         return () => { if (listenProgressRef.current) clearInterval(listenProgressRef.current); };
       }, [mode, isListenPlaying]);
-      
-      // Cancel pre-gen when listening stops or chapter changes
-      useEffect(() => {
-        if (mode !== 'listen' || !isListenPlaying) {
-          pregenCancelRef.current = true;
-        }
-      }, [mode, isListenPlaying, chapterIndex]);
 
       // ============================================================
       // EVENT HANDLERS
