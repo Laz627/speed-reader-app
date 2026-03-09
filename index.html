@@ -1114,22 +1114,6 @@
     const WORKER_CODE = `
       let tts = null;
       
-      // Simple sentence splitter for chunked generation
-      function splitSentences(text) {
-        const raw = text.match(/[^.!?]*[.!?]+["\\u201D\\u2019'"]*\\s*/g);
-        if (!raw || raw.length === 0) return [text];
-        // Merge very short sentences with previous
-        const merged = [];
-        for (const s of raw) {
-          if (merged.length > 0 && s.trim().length < 30) {
-            merged[merged.length - 1] += s;
-          } else {
-            merged.push(s);
-          }
-        }
-        return merged.filter(s => s.trim().length > 0);
-      }
-      
       self.onmessage = async (e) => {
         const { type, id, payload } = e.data;
         
@@ -1196,36 +1180,38 @@
         }
         
         if (type === 'stream-para') {
-          // Split paragraph into sentences, generate each, send chunks back
+          // Generate entire paragraph in one call. No sentence splitting —
+          // each generate() has high fixed overhead on mobile, so fewer calls = faster.
+          // Kokoro handles up to ~510 tokens internally.
           if (!tts) { self.postMessage({ type: 'stream-error', id, error: 'Not loaded' }); return; }
           try {
-            const sentences = splitSentences(payload.text);
-            for (let i = 0; i < sentences.length; i++) {
-              const s = sentences[i].trim();
-              if (s.length < 2) continue;
-              
-              const result = await tts.generate(s, {
-                voice: payload.voice || 'af_heart',
-                speed: payload.speed || 1.0,
-              });
-              
-              let raw = null;
-              let sr = 24000;
-              const a = result.audio !== undefined ? result.audio : result;
-              if (a instanceof Float32Array) { raw = a; }
-              else if (a && a.audio instanceof Float32Array) { raw = a.audio; sr = a.sampling_rate || sr; }
-              else if (a && a.data) { raw = new Float32Array(a.data); }
-              else if (a && a.audio && a.audio.data) { raw = new Float32Array(a.audio.data); sr = a.sampling_rate || sr; }
-              if (result.sampling_rate) sr = result.sampling_rate;
-              
-              self.postMessage({
-                type: 'chunk', id, idx: i,
-                samples: raw && raw.length > 0 ? Array.from(raw) : [],
-                sampleRate: sr,
-                text: s.substring(0, 50),
-              });
+            const text = payload.text.trim();
+            if (text.length < 2) {
+              self.postMessage({ type: 'stream-end', id, total: 0 });
+              return;
             }
-            self.postMessage({ type: 'stream-end', id, total: sentences.length });
+            
+            const result = await tts.generate(text, {
+              voice: payload.voice || 'af_heart',
+              speed: payload.speed || 1.0,
+            });
+            
+            let raw = null;
+            let sr = 24000;
+            const a = result.audio !== undefined ? result.audio : result;
+            if (a instanceof Float32Array) { raw = a; }
+            else if (a && a.audio instanceof Float32Array) { raw = a.audio; sr = a.sampling_rate || sr; }
+            else if (a && a.data) { raw = new Float32Array(a.data); }
+            else if (a && a.audio && a.audio.data) { raw = new Float32Array(a.audio.data); sr = a.sampling_rate || sr; }
+            if (result.sampling_rate) sr = result.sampling_rate;
+            
+            self.postMessage({
+              type: 'chunk', id, idx: 0,
+              samples: raw && raw.length > 0 ? Array.from(raw) : [],
+              sampleRate: sr,
+              text: text.substring(0, 50),
+            });
+            self.postMessage({ type: 'stream-end', id, total: 1 });
           } catch(err) {
             self.postMessage({ type: 'stream-error', id, error: err.message });
           }
