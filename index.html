@@ -1534,153 +1534,9 @@
       }
       
       // ============================================================
-      // CORE: Generate audio via the /call/predict REST API
-      //
-      // This is Gradio's simpler REST API (vs the queue/join SSE approach):
-      //   1. POST /gradio_api/call/predict → {"event_id": "..."}
-      //   2. GET  /gradio_api/call/predict/{event_id} → SSE with "event: complete\ndata: [{url}]"
-      //   3. GET  audio URL → WAV file
-      //
-      // Much more reliable cross-origin than the SSE queue approach.
-      // ============================================================
-      
-      async _generateSentence(text, voice, speed) {
-        const trimmed = text.trim();
-        if (trimmed.length < 2) return null;
-        
-        // Step 1: Submit to /call/predict
-        debugLog('[HF] → POST /call/predict: "' + trimmed.substring(0, 50) + (trimmed.length > 50 ? '...' : '') + '"');
-        
-        let callRes;
-        try {
-          callRes = await fetch(this.HF_BASE + '/gradio_api/call/predict', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              data: [trimmed, voice || 'af_heart', speed || 1.0]
-            })
-          });
-        } catch(fetchErr) {
-          debugLog('[HF] ❌ /call/predict POST error: ' + fetchErr.message);
-          throw new Error('Network error: ' + fetchErr.message);
-        }
-        
-        debugLog('[HF] ← POST: HTTP ' + callRes.status);
-        if (!callRes.ok) {
-          const errText = await callRes.text().catch(() => '(no body)');
-          debugLog('[HF] ❌ POST error body: ' + errText.substring(0, 200));
-          throw new Error('API returned HTTP ' + callRes.status + ': ' + errText.substring(0, 100));
-        }
-        
-        const callData = await callRes.json();
-        const eventId = callData.event_id;
-        debugLog('[HF] ← event_id: ' + eventId);
-        
-        if (!eventId) throw new Error('No event_id returned from API');
-        
-        // Step 2: GET the result (SSE stream — but usually just one "complete" event)
-        debugLog('[HF] → GET /call/predict/' + eventId);
-        const controller = new AbortController();
-        const timeout = setTimeout(() => {
-          debugLog('[HF] ⏰ Result timeout (60s), aborting');
-          controller.abort();
-        }, 60000); // 60s timeout for CPU inference
-        
-        let resultText;
-        try {
-          const resultRes = await fetch(
-            this.HF_BASE + '/gradio_api/call/predict/' + eventId,
-            { signal: controller.signal }
-          );
-          clearTimeout(timeout);
-          debugLog('[HF] ← GET: HTTP ' + resultRes.status);
-          
-          if (!resultRes.ok) {
-            const errText = await resultRes.text().catch(() => '(no body)');
-            throw new Error('Result fetch HTTP ' + resultRes.status + ': ' + errText.substring(0, 100));
-          }
-          
-          resultText = await resultRes.text();
-          debugLog('[HF] ← Result: ' + resultText.length + ' chars');
-        } catch(e) {
-          clearTimeout(timeout);
-          if (e.name === 'AbortError') throw new Error('Generation timed out after 60s');
-          throw e;
-        }
-        
-        // Step 3: Parse the SSE result for the audio URL
-        // Format: "event: complete\ndata: [{url, path, ...}]"
-        let audioUrl = null;
-        
-        const lines = resultText.split('\n');
-        for (let i = 0; i < lines.length; i++) {
-          const line = lines[i];
-          if (line.startsWith('data: ')) {
-            try {
-              const parsed = JSON.parse(line.slice(6));
-              // parsed is an array: [{path, url, ...}]
-              if (Array.isArray(parsed) && parsed.length > 0) {
-                const fileInfo = parsed[0];
-                // Always route audio through the proxy — direct HF URLs get CORS blocked
-                if (fileInfo?.path) {
-                  audioUrl = this.HF_BASE + '/gradio_api/file=' + fileInfo.path;
-                } else if (fileInfo?.url) {
-                  // Rewrite direct HF URL to go through proxy
-                  const match = fileInfo.url.match(/\/gradio_api\/file=(.+)/);
-                  if (match) {
-                    audioUrl = this.HF_BASE + '/gradio_api/file=' + match[1];
-                  } else {
-                    audioUrl = fileInfo.url; // fallback
-                  }
-                }
-              }
-            } catch(e) {
-              // Check for error event
-              if (lines[i - 1]?.includes('event: error')) {
-                debugLog('[HF] ❌ Server error: ' + line.slice(6));
-                throw new Error('Server error: ' + line.slice(6).substring(0, 100));
-              }
-            }
-          }
-        }
-        
-        if (!audioUrl) {
-          debugLog('[HF] ❌ No audio URL. Response:\n' + resultText.substring(0, 500));
-          throw new Error('No audio URL in response');
-        }
-        
-        debugLog('[HF] Audio URL: ' + audioUrl.substring(0, 80) + '...');
-        
-        // Step 4: Fetch the WAV audio file
-        let audioRes;
-        try {
-          audioRes = await fetch(audioUrl);
-        } catch(fetchErr) {
-          debugLog('[HF] ❌ Audio fetch error: ' + fetchErr.message);
-          throw new Error('Audio download failed: ' + fetchErr.message);
-        }
-        
-        debugLog('[HF] ← audio: HTTP ' + audioRes.status + ', size: ' + (audioRes.headers.get('content-length') || '?'));
-        if (!audioRes.ok) throw new Error('Audio download HTTP ' + audioRes.status);
-        
-        const arrayBuf = await audioRes.arrayBuffer();
-        if (arrayBuf.byteLength < 100) throw new Error('Audio too small: ' + arrayBuf.byteLength + 'B');
-        
-        // Step 5: Decode to AudioBuffer
-        let audioBuf;
-        try {
-          audioBuf = await this.audioContext.decodeAudioData(arrayBuf.slice(0));
-        } catch(decodeErr) {
-          debugLog('[HF] ❌ decodeAudioData failed: ' + decodeErr.message);
-          throw new Error('Audio decode failed: ' + decodeErr.message);
-        }
-        
-        debugLog('[HF] ✓ ' + audioBuf.duration.toFixed(1) + 's, ' + audioBuf.sampleRate + 'Hz');
-        return audioBuf;
-      }
-      
-      // ============================================================
-      // SENTENCE-LEVEL PLAYBACK
+      // PARAGRAPH PLAYBACK: One API call per paragraph
+      // Server-side Kokoro handles sentence splitting + concatenation.
+      // This eliminates queue contention from multiple concurrent requests.
       // ============================================================
       
       async streamParagraph(text, voice, speed, onFirst, onDone) {
@@ -1689,46 +1545,127 @@
         this._onDone = onDone;
         this._estDur = (text.split(/\s+/).length / 150) * 60 / (speed || 1);
         
-        let n = 0, firstSent = false;
-        
         try {
-          const sentences = text.match(/[^.!?]*[.!?]+["'"'\u201D\u2019]?\s*/g) || [text];
-          const chunks = [];
-          for (const s of sentences) {
-            if (chunks.length > 0 && s.trim().length < 30) {
-              chunks[chunks.length - 1] += s;
-            } else if (s.trim().length > 0) {
-              chunks.push(s);
-            }
+          debugLog('[HF] Generating full paragraph (' + text.length + ' chars)...');
+          
+          const buf = await this._generateParagraph(text, voice, speed);
+          if (this._cancelled) return;
+          
+          if (!buf) {
+            debugLog('[HF] No audio returned');
+            if (onDone) onDone();
+            return;
           }
           
-          debugLog('[HF] streamParagraph: ' + chunks.length + ' chunks from ' + text.length + ' chars');
-          
-          for (const chunk of chunks) {
-            if (this._cancelled) break;
-            const trimmed = chunk.trim();
-            if (trimmed.length < 2) continue;
-            
-            const buf = await this._generateSentence(trimmed, voice, speed);
-            if (this._cancelled) break;
-            if (!buf) continue;
-            
-            n++;
-            debugLog('[HF] Chunk ' + n + '/' + chunks.length + ': ' + buf.duration.toFixed(1) + 's');
-            this._enq(buf);
-            
-            if (!firstSent) { firstSent = true; if (onFirst) onFirst(); }
-          }
+          debugLog('[HF] Paragraph audio: ' + buf.duration.toFixed(1) + 's');
+          if (onFirst) onFirst();
+          this._enq(buf);
         } catch(e) {
           if (!this._cancelled) {
             debugLog('[HF] ❌ streamParagraph error: ' + e.message);
-            console.error('[HF] Stream error:', e);
+            console.error('[HF] Error:', e);
           }
         }
         
         this._allEnqueued = true;
-        debugLog('[HF] Done: ' + n + ' chunks, ' + this._totalDur.toFixed(1) + 's audio');
         if (!this._playing && this._queue.length === 0 && this._onDone) this._onDone();
+      }
+      
+      // Generate full paragraph via /call/generate_paragraph endpoint
+      async _generateParagraph(text, voice, speed) {
+        const trimmed = text.trim();
+        if (trimmed.length < 2) return null;
+        
+        debugLog('[HF] → POST /call/generate_paragraph: "' + trimmed.substring(0, 60) + (trimmed.length > 60 ? '...' : '') + '"');
+        
+        let callRes;
+        try {
+          callRes = await fetch(this.HF_BASE + '/gradio_api/call/generate_paragraph', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              data: [trimmed, voice || 'af_heart', speed || 1.0]
+            })
+          });
+        } catch(fetchErr) {
+          debugLog('[HF] ❌ POST error: ' + fetchErr.message);
+          throw new Error('Network error: ' + fetchErr.message);
+        }
+        
+        debugLog('[HF] ← POST: HTTP ' + callRes.status);
+        if (!callRes.ok) {
+          const errText = await callRes.text().catch(() => '(no body)');
+          throw new Error('API returned HTTP ' + callRes.status + ': ' + errText.substring(0, 100));
+        }
+        
+        const callData = await callRes.json();
+        const eventId = callData.event_id;
+        debugLog('[HF] ← event_id: ' + eventId);
+        if (!eventId) throw new Error('No event_id returned');
+        
+        // GET result — longer timeout for full paragraph on CPU
+        const controller = new AbortController();
+        const timeout = setTimeout(() => {
+          debugLog('[HF] ⏰ Timeout (120s), aborting');
+          controller.abort();
+        }, 120000);
+        
+        let resultText;
+        try {
+          const resultRes = await fetch(
+            this.HF_BASE + '/gradio_api/call/generate_paragraph/' + eventId,
+            { signal: controller.signal }
+          );
+          clearTimeout(timeout);
+          debugLog('[HF] ← GET: HTTP ' + resultRes.status);
+          if (!resultRes.ok) throw new Error('Result HTTP ' + resultRes.status);
+          resultText = await resultRes.text();
+          debugLog('[HF] ← Result: ' + resultText.length + ' chars');
+        } catch(e) {
+          clearTimeout(timeout);
+          if (e.name === 'AbortError') throw new Error('Timed out after 120s');
+          throw e;
+        }
+        
+        // Parse audio URL from SSE result
+        let audioUrl = null;
+        for (const line of resultText.split('\n')) {
+          if (!line.startsWith('data: ')) continue;
+          try {
+            const parsed = JSON.parse(line.slice(6));
+            if (Array.isArray(parsed) && parsed.length > 0) {
+              const fileInfo = parsed[0];
+              if (fileInfo?.path) {
+                audioUrl = this.HF_BASE + '/gradio_api/file=' + fileInfo.path;
+              } else if (fileInfo?.url) {
+                const match = fileInfo.url.match(/\/gradio_api\/file=(.+)/);
+                audioUrl = match
+                  ? this.HF_BASE + '/gradio_api/file=' + match[1]
+                  : fileInfo.url;
+              }
+            }
+          } catch(e) {
+            if (line.includes('event: error')) throw new Error('Server error');
+          }
+        }
+        
+        if (!audioUrl) {
+          debugLog('[HF] ❌ No audio URL. Response:\n' + resultText.substring(0, 300));
+          throw new Error('No audio URL in response');
+        }
+        
+        debugLog('[HF] Audio: ' + audioUrl.substring(0, 80) + '...');
+        
+        // Fetch + decode WAV
+        const audioRes = await fetch(audioUrl);
+        if (!audioRes.ok) throw new Error('Audio download HTTP ' + audioRes.status);
+        const arrayBuf = await audioRes.arrayBuffer();
+        debugLog('[HF] ← ' + arrayBuf.byteLength + ' bytes');
+        if (arrayBuf.byteLength < 100) throw new Error('Audio too small');
+        
+        const audioBuf = await this.audioContext.decodeAudioData(arrayBuf.slice(0));
+        debugLog('[HF] ✓ ' + audioBuf.duration.toFixed(1) + 's, ' + audioBuf.sampleRate + 'Hz');
+        return audioBuf;
       }
       
       // ============================================================
@@ -1780,7 +1717,7 @@
         if (this._preCache[key] || this._prePromises[key]) return;
         this._prePromises[key] = (async () => {
           try {
-            const buf = await this._generateSentence(text, voice, speed);
+            const buf = await this._generateParagraph(text, voice, speed);
             if (buf) {
               this._preCache[key] = buf;
               debugLog('[HF] Pre-gen: ' + key + ' (' + buf.duration.toFixed(1) + 's)');
@@ -2489,11 +2426,15 @@
             }
             
             // Pre-generate next 2 paragraphs while current plays
-            for (let ahead = 1; ahead <= 2; ahead++) {
-              const futureIdx = listenParagraphIdx + ahead;
-              if (futureIdx < paragraphRanges.length && !cancelled) {
-                const futureKey = chapterIndex + ':' + futureIdx;
-                ttsManager.pregenerate(futureKey, paragraphRanges[futureIdx].text, selectedVoice, listenSpeed);
+            // Disabled for HF Space: CPU server can only handle one request at a time,
+            // concurrent pre-gen causes queue contention and 60s+ timeouts
+            if (!USE_HF_SPACE) {
+              for (let ahead = 1; ahead <= 2; ahead++) {
+                const futureIdx = listenParagraphIdx + ahead;
+                if (futureIdx < paragraphRanges.length && !cancelled) {
+                  const futureKey = chapterIndex + ':' + futureIdx;
+                  ttsManager.pregenerate(futureKey, paragraphRanges[futureIdx].text, selectedVoice, listenSpeed);
+                }
               }
             }
             
