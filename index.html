@@ -1478,8 +1478,9 @@
         this._preCache = {};
         this._prePromises = {};
         
-        // Your duplicated Space — API is open, CPU-only, free tier
-        this.HF_BASE = 'https://laz627-kokoro-tts.hf.space';
+        // Cloudflare Worker proxy — strips Origin header to bypass HF's CORS block
+        // Direct HF Space URL: https://laz627-kokoro-tts.hf.space
+        this.HF_BASE = 'https://kokoro-proxy.brandonlazovic.workers.dev';
       }
       
       // ============================================================
@@ -1620,10 +1621,17 @@
               // parsed is an array: [{path, url, ...}]
               if (Array.isArray(parsed) && parsed.length > 0) {
                 const fileInfo = parsed[0];
-                if (fileInfo?.url) {
-                  audioUrl = fileInfo.url;
-                } else if (fileInfo?.path) {
+                // Always route audio through the proxy — direct HF URLs get CORS blocked
+                if (fileInfo?.path) {
                   audioUrl = this.HF_BASE + '/gradio_api/file=' + fileInfo.path;
+                } else if (fileInfo?.url) {
+                  // Rewrite direct HF URL to go through proxy
+                  const match = fileInfo.url.match(/\/gradio_api\/file=(.+)/);
+                  if (match) {
+                    audioUrl = this.HF_BASE + '/gradio_api/file=' + match[1];
+                  } else {
+                    audioUrl = fileInfo.url; // fallback
+                  }
                 }
               }
             } catch(e) {
