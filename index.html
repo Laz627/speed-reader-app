@@ -1447,17 +1447,23 @@
       // Play a pre-generated buffer directly
       async playBuffer(buf, onEnd) {
         this._resetQueue();
+        this._cancelled = false;
         this._totalDur = buf.duration;
         this._estDur = buf.duration;
         this._allEnqueued = true;
-        if (this.audioContext.state === 'suspended') await this.audioContext.resume();
+        debugLog('[AUDIO] playBuffer: ' + buf.duration.toFixed(1) + 's, ctx=' + this.audioContext.state + ', gain=' + this.gainNode.gain.value);
+        if (this.audioContext.state === 'suspended') {
+          await this.audioContext.resume();
+          debugLog('[AUDIO] Resumed AudioContext');
+        }
         const src = this.audioContext.createBufferSource();
         src.buffer = buf;
         src.connect(this.gainNode);
-        src.onended = () => { this.currentSource = null; if (onEnd) onEnd(); };
+        src.onended = () => { this.currentSource = null; debugLog('[AUDIO] Buffer ended'); if (onEnd) onEnd(); };
         src.start();
         this.currentSource = src;
         this._chunkStart = this.audioContext.currentTime;
+        debugLog('[AUDIO] Started playback, currentTime=' + this.audioContext.currentTime.toFixed(1));
       }
       
       stop() { if (this.currentSource) { try { this.currentSource.stop(); } catch(e) {} this.currentSource = null; } }
