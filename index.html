@@ -2072,6 +2072,7 @@
       const saveIntervalRef = useRef(null);
       const splashTimeoutRef = useRef(null);
       const listenProgressRef = useRef(null);
+      const pregenCancelRef = useRef(false); // Separate from effect cleanup — survives paragraph advances
       const touchStartRef = useRef(null);
       
       // Ramp-up counter: counts words since last pause for easing
@@ -2497,6 +2498,7 @@
         if (paragraphRanges.length === 0) return;
         
         let cancelled = false;
+        pregenCancelRef.current = false; // Allow pre-gen across paragraph advances
         setListenAudioProgress(0);
         
         const advanceParagraph = () => {
@@ -2563,15 +2565,14 @@
           setIsGenerating(true);
           const paraKey = chapterIndex + ':' + listenParagraphIdx;
           
-          // Fire rolling pre-gen immediately — GPU serializes generate() calls,
-          // so these queue behind current paragraph's chunks and start the instant
-          // the last chunk finishes. No wasted idle time.
+          // Fire rolling pre-gen — uses pregenCancelRef (persists across paragraph advances)
+          // instead of effect's `cancelled` flag (which resets every paragraph).
           const firePregen = () => {
-            if (cancelled) return;
+            if (pregenCancelRef.current) return;
             (async () => {
               const maxAhead = IS_MOBILE ? 10 : 3;
               for (let ahead = 1; ahead <= maxAhead; ahead++) {
-                if (cancelled) break;
+                if (pregenCancelRef.current) break;
                 const futureIdx = listenParagraphIdx + ahead;
                 if (futureIdx >= paragraphRanges.length) break;
                 
@@ -2664,6 +2665,13 @@
         
         return () => { if (listenProgressRef.current) clearInterval(listenProgressRef.current); };
       }, [mode, isListenPlaying]);
+      
+      // Cancel pre-gen when listening stops or chapter changes
+      useEffect(() => {
+        if (mode !== 'listen' || !isListenPlaying) {
+          pregenCancelRef.current = true;
+        }
+      }, [mode, isListenPlaying, chapterIndex]);
 
       // ============================================================
       // EVENT HANDLERS
