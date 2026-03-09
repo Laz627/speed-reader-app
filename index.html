@@ -1100,6 +1100,50 @@
     // Uses dynamic import() to load transformers.js only when needed.
     // ============================================================
     
+    /**
+     * Split text that exceeds Kokoro's practical per-call limit (~500 chars).
+     * Splits at sentence boundaries to keep natural speech flow.
+     * Short text passes through unchanged.
+     */
+    function splitLongText(text) {
+      const MAX_CHARS = 500;
+      if (text.length <= MAX_CHARS) return [text];
+      
+      // Split into sentences
+      const raw = text.match(/[^.!?]*[.!?]+["'"'\u201D\u2019]?\s*/g);
+      if (!raw || raw.length <= 1) {
+        // Can't split by sentences — force split at word boundaries
+        const words = text.split(/\s+/);
+        const chunks = [];
+        let current = '';
+        for (const word of words) {
+          if ((current + ' ' + word).length > MAX_CHARS && current.length > 0) {
+            chunks.push(current.trim());
+            current = word;
+          } else {
+            current += (current ? ' ' : '') + word;
+          }
+        }
+        if (current.trim()) chunks.push(current.trim());
+        return chunks;
+      }
+      
+      // Merge sentences into chunks under the char limit
+      const chunks = [];
+      let current = '';
+      for (const sentence of raw) {
+        if ((current + sentence).length > MAX_CHARS && current.length > 0) {
+          chunks.push(current.trim());
+          current = sentence;
+        } else {
+          current += sentence;
+        }
+      }
+      if (current.trim()) chunks.push(current.trim());
+      
+      return chunks.filter(c => c.length > 0);
+    }
+
     class KokoroTTSManager {
       constructor() {
         this.tts = null;
@@ -1205,25 +1249,35 @@
       }
       
       /**
-       * Generate audio for a paragraph, optionally splitting dialogue.
-       * If dialogueSplit is true, splits at quote boundaries and uses different voices.
-       * Returns a single AudioBuffer (concatenated if split).
+       * Generate audio for a paragraph, handling long text by splitting at
+       * sentence boundaries if needed. Kokoro has a practical limit per call.
+       * Optionally splits dialogue into separate voice segments.
        */
       async generateParagraph(text, narratorVoice, dialogueVoice, speed, dialogueSplit) {
-        if (!dialogueSplit) {
+        if (dialogueSplit) {
+          const segments = splitParagraphForVoices(text);
+          if (segments.length > 1) {
+            const buffers = [];
+            for (const seg of segments) {
+              const voice = seg.voice === 'dialogue' ? dialogueVoice : narratorVoice;
+              const chunks = splitLongText(seg.text);
+              for (const chunk of chunks) {
+                buffers.push(await this.generate(chunk, voice, speed));
+              }
+            }
+            return this._concatBuffers(buffers);
+          }
+        }
+        
+        // Single voice — split if text is too long
+        const chunks = splitLongText(text);
+        if (chunks.length === 1) {
           return this.generate(text, narratorVoice, speed);
         }
         
-        const segments = splitParagraphForVoices(text);
-        if (segments.length <= 1) {
-          return this.generate(text, narratorVoice, speed);
-        }
-        
-        // Generate each segment with the appropriate voice
         const buffers = [];
-        for (const seg of segments) {
-          const voice = seg.voice === 'dialogue' ? dialogueVoice : narratorVoice;
-          buffers.push(await this.generate(seg.text, voice, speed));
+        for (const chunk of chunks) {
+          buffers.push(await this.generate(chunk, narratorVoice, speed));
         }
         return this._concatBuffers(buffers);
       }
