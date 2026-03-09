@@ -10,11 +10,13 @@
   
   <title>Speed Reader</title>
   
-  <!-- Import map: resolves onnxruntime-web for Piper TTS WASM inference -->
+  <!-- Import map: resolves bare "onnxruntime-web" specifier for Piper TTS.
+       esm.sh rewrites onnxruntime-web's internal dynamic imports so they
+       resolve correctly in the browser without a bundler. -->
   <script type="importmap">
   {
     "imports": {
-      "onnxruntime-web": "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/ort.all.min.mjs"
+      "onnxruntime-web": "https://esm.sh/onnxruntime-web@1.18.0"
     }
   }
   </script>
@@ -1196,11 +1198,13 @@
           const selectedVoice = voiceId || 'en_US-lessac-medium';
           console.log('[TTS] Loading voice: ' + selectedVoice);
           
-          // Explicit WASM paths — avoid the broken cdnjs default.
-          // onnxruntime-web WASM binaries load from jsdelivr (same place the importmap points).
-          // Piper phonemizer WASM/data from jsdelivr as well.
+          // Explicit WASM paths for reliable loading:
+          // - ONNX WASM binaries (.wasm files) from cdnjs — the default, but explicit to be safe
+          // - Piper phonemizer WASM/data from jsdelivr
+          // Note: The JS module for onnxruntime-web is resolved via importmap → esm.sh,
+          // but the actual WASM binaries are fetched separately via these paths.
           const wasmPaths = {
-            onnxWasm: 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/',
+            onnxWasm: 'https://cdnjs.cloudflare.com/ajax/libs/onnxruntime-web/1.18.0/',
             piperData: 'https://cdn.jsdelivr.net/npm/@diffusionstudio/piper-wasm@1.0.0/build/piper_phonemize.data',
             piperWasm: 'https://cdn.jsdelivr.net/npm/@diffusionstudio/piper-wasm@1.0.0/build/piper_phonemize.wasm',
           };
