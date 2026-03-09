@@ -1206,15 +1206,17 @@
       }
       
       async init(onProgress, opts = {}) {
-        const preferredDtype = opts.dtype || 'fp16';
+        const preferredDtype = opts.dtype || 'fp32';
+        // On mobile WebGPU, we always force fp32 regardless of preference
+        const effectiveDtype = IS_MOBILE ? 'fp32' : preferredDtype;
         
         // Allow re-init if dtype changed
-        if (this.status === 'ready' && this._loadedDtype === preferredDtype) return;
+        if (this.status === 'ready' && this._loadedDtype === effectiveDtype) return;
         if (this.status === 'loading') return;
         
         // If re-initializing with different dtype, destroy old model first
-        if (this.tts && this._loadedDtype !== preferredDtype) {
-          debugLog('[TTS] Reinitializing: ' + this._loadedDtype + ' → ' + preferredDtype);
+        if (this.tts && this._loadedDtype !== effectiveDtype) {
+          debugLog('[TTS] Reinitializing: ' + this._loadedDtype + ' → ' + effectiveDtype);
           this.destroy();
         }
         
@@ -1248,10 +1250,12 @@
             }
           } catch(e) {}
           
-          // dtype: user-selected for WebGPU (fp32, fp16, q8, q4, q4f16)
-          //        q8 for WASM (WASM handles quantized formats fine)
-          const dtype = device === 'webgpu' ? preferredDtype : 'q8';
-          this._loadedDtype = preferredDtype;
+          // dtype: fp32 required on mobile WebGPU — lower precision formats (fp16, q8, q4)
+          // produce silent audio despite valid buffer metadata (mobile WebGPU shader bug).
+          // On desktop WebGPU, user-selected dtype works fine.
+          // On WASM, q8 is the standard choice.
+          const dtype = device !== 'webgpu' ? 'q8' : (IS_MOBILE ? 'fp32' : preferredDtype);
+          this._loadedDtype = dtype;
           
           debugLog('[TTS] Loading: ' + dtype + '/' + device + (IS_MOBILE ? ' (mobile)' : ' (desktop)'));
           
@@ -1320,22 +1324,49 @@
         
         try {
           if (IS_MOBILE) {
-            // Mobile: single generate() call for whole paragraph.
-            // Avoids per-sentence overhead, lets Kokoro optimize internally.
-            // Longer wait before first audio, but zero intra-paragraph gaps.
-            const trimmed = text.trim();
-            if (trimmed.length < 2) { if (onDone) onDone(); return; }
+            // Mobile: smart chunking — group sentences into ~400 char chunks.
+            // Single generate() per paragraph overflows Kokoro's ~510 token context
+            // on long paragraphs, causing whisper/garbling on the tail.
+            // Per-sentence is too many round trips. Grouping 2-4 sentences per chunk
+            // balances GPU efficiency with context safety.
+            const sentences = text.match(/[^.!?]*[.!?]+["'"'\u201D\u2019]?\s*/g) || [text];
+            const chunks = [];
+            let current = '';
+            for (const s of sentences) {
+              const trimmedS = s.trim();
+              if (!trimmedS) continue;
+              // Start new chunk if adding this sentence would exceed ~400 chars
+              if (current.length > 0 && (current.length + trimmedS.length) > 400) {
+                chunks.push(current);
+                current = trimmedS;
+              } else {
+                current += (current ? ' ' : '') + trimmedS;
+              }
+            }
+            if (current.trim()) chunks.push(current.trim());
             
-            debugLog('[TTS] Generating paragraph (' + trimmed.length + ' chars)...');
-            const result = await this.tts.generate(trimmed, { voice: voice || 'af_heart', speed: speed || 1.0 });
-            if (this._cancelled) return;
+            debugLog('[TTS] Paragraph: ' + chunks.length + ' chunks from ' + text.length + ' chars');
             
-            const buf = this._toBuf(result);
-            if (!buf) { console.warn('[TTS] Empty result'); if (onDone) onDone(); return; }
-            
-            debugLog('[TTS] Paragraph: ' + buf.duration.toFixed(1) + 's');
-            this._enq(buf);
-            if (onFirst) onFirst();
+            let n = 0, firstSent = false;
+            for (const chunk of chunks) {
+              if (this._cancelled) break;
+              if (chunk.length < 2) continue;
+              
+              debugLog('[TTS] Chunk ' + (n + 1) + '/' + chunks.length + ' (' + chunk.length + ' chars)...');
+              const result = await this.tts.generate(chunk, { voice: voice || 'af_heart', speed: speed || 1.0 });
+              if (this._cancelled) break;
+              
+              const buf = this._toBuf(result);
+              if (!buf) { debugLog('[TTS] Empty chunk, skipping'); continue; }
+              
+              n++;
+              debugLog('[TTS] Chunk ' + n + ': ' + buf.duration.toFixed(1) + 's');
+              this._enq(buf);
+              
+              if (!firstSent) { firstSent = true; if (onFirst) onFirst(); }
+              await new Promise(r => setTimeout(r, 0));
+            }
+            debugLog('[TTS] Done: ' + n + ' chunks, ' + this._totalDur.toFixed(1) + 's audio');
           } else {
             // Desktop: sentence-by-sentence for faster time-to-first-audio.
             // With WebGPU on desktop, each generate() is ~150-600ms.
@@ -1423,15 +1454,60 @@
         if (this._preCache[key] || this._prePromises[key]) return;
         this._prePromises[key] = (async () => {
           try {
-            // Use generate() for pre-gen (single call, whole paragraph)
-            const result = await this.tts.generate(text, { voice: voice || 'af_heart', speed: speed || 1.0 });
-            const buf = this._toBuf(result);
-            if (buf) {
-              this._preCache[key] = buf;
-              console.log('[TTS] Pre-gen: ' + key + ' (' + buf.duration.toFixed(1) + 's)');
+            // Smart chunk: split into ~400 char groups to stay within context limit
+            const sentences = text.match(/[^.!?]*[.!?]+["'"'\u201D\u2019]?\s*/g) || [text];
+            const chunks = [];
+            let current = '';
+            for (const s of sentences) {
+              const t = s.trim();
+              if (!t) continue;
+              if (current.length > 0 && (current.length + t.length) > 400) {
+                chunks.push(current);
+                current = t;
+              } else {
+                current += (current ? ' ' : '') + t;
+              }
             }
+            if (current.trim()) chunks.push(current.trim());
+            
+            // Generate each chunk and concatenate into one AudioBuffer
+            const buffers = [];
+            let totalLength = 0;
+            let sr = 24000;
+            for (const chunk of chunks) {
+              if (chunk.length < 2) continue;
+              const result = await this.tts.generate(chunk, { voice: voice || 'af_heart', speed: speed || 1.0 });
+              const buf = this._toBuf(result);
+              if (buf) {
+                buffers.push(buf);
+                totalLength += buf.length;
+                sr = buf.sampleRate;
+              }
+            }
+            
+            if (buffers.length === 0) { delete this._prePromises[key]; return; }
+            
+            // Concatenate into single AudioBuffer
+            let combined;
+            if (buffers.length === 1) {
+              combined = buffers[0];
+            } else {
+              combined = this.audioContext.createBuffer(1, totalLength, sr);
+              const channel = combined.getChannelData(0);
+              let offset = 0;
+              for (const buf of buffers) {
+                channel.set(buf.getChannelData(0), offset);
+                offset += buf.length;
+              }
+            }
+            
+            this._preCache[key] = combined;
+            debugLog('[TTS] Pre-gen: ' + key + ' (' + combined.duration.toFixed(1) + 's, ' + chunks.length + ' chunks)');
             delete this._prePromises[key];
-          } catch(e) { delete this._prePromises[key]; }
+          } catch(e) {
+            debugLog('[TTS] Pre-gen failed: ' + key + ' — ' + e.message);
+            delete this._prePromises[key];
+          }
         })();
       }
       
@@ -1959,7 +2035,7 @@
       const [isListenPlaying, setIsListenPlaying] = useState(false);
       const [listenSpeed, setListenSpeed] = useState(savedPrefs.current.listenSpeed || 1.0);
       const [selectedVoice, setSelectedVoice] = useState(savedPrefs.current.voice || 'af_heart');
-      const [modelQuality, setModelQuality] = useState(savedPrefs.current.modelQuality || 'fp16');
+      const [modelQuality, setModelQuality] = useState(savedPrefs.current.modelQuality || 'fp32');
       const [dialogueVoice, setDialogueVoice] = useState(savedPrefs.current.dialogueVoice || 'af_bella');
       const [dialogueSplitEnabled, setDialogueSplitEnabled] = useState(savedPrefs.current.dialogueSplit || false);
       const [modelStatus, setModelStatus] = useState('idle');
@@ -3064,41 +3140,56 @@
         const para = paragraphRanges[listenParagraphIdx];
         if (!para) return e('div', { style: { color: theme.muted, textAlign: 'center' } }, 'No paragraph available');
         
-        return e('div', { style: { display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', width: '100%', height: '100%', overflow: 'auto', padding: '1rem' } }, [
+        return e('div', { style: { display: 'flex', flexDirection: 'column', alignItems: 'center', width: '100%', height: '100%', overflow: 'hidden', padding: '1rem' } }, [
           // Paragraph number indicator
-          e('div', { key: 'para-num', style: { fontSize: '0.6875rem', fontWeight: '600', textTransform: 'uppercase', letterSpacing: '0.1em', color: theme.muted, marginBottom: '0.75rem' } },
+          e('div', { key: 'para-num', style: { fontSize: '0.6875rem', fontWeight: '600', textTransform: 'uppercase', letterSpacing: '0.1em', color: theme.muted, marginBottom: '0.75rem', flexShrink: 0 } },
             '\u00B6 ' + (listenParagraphIdx + 1) + ' / ' + paragraphRanges.length
             + (isGenerating ? ' \u2022 Generating...' : isListenPlaying ? ' \u2022 Playing' : '')),
           
-          // The paragraph text with estimated word-level highlighting
-          // We split text into words and highlight based on audio progress percentage
+          // Scrollable paragraph container — auto-scrolls to keep highlighted word visible
           e('div', {
-            key: 'para-text',
-            className: 'listen-paragraph',
+            key: 'para-scroll',
             style: {
-              fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
-              color: theme.text,
+              flex: 1,
+              overflow: 'auto',
+              width: '100%',
+              display: 'flex',
+              justifyContent: 'center',
+              WebkitOverflowScrolling: 'touch',
             }
-          }, (() => {
-            const paraWords = para.text.split(/\s+/);
-            const highlightIdx = Math.floor(listenAudioProgress * paraWords.length);
-            return paraWords.map((w, i) =>
-              e('span', {
-                key: i,
-                className: 'listen-word' + (isListenPlaying && i === highlightIdx ? ' active' : ''),
-                style: {
-                  opacity: isListenPlaying ? (i < highlightIdx ? 0.5 : i === highlightIdx ? 1 : 0.85) : 1,
-                  transition: 'opacity 0.15s, background-color 0.1s',
-                  fontWeight: isListenPlaying && i === highlightIdx ? '600' : '400',
-                }
-              }, w + (i < paraWords.length - 1 ? ' ' : ''))
-            );
-          })()),
+          },
+            e('div', {
+              key: 'para-text',
+              className: 'listen-paragraph',
+              style: {
+                fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
+                color: theme.text,
+              }
+            }, (() => {
+              const paraWords = para.text.split(/\s+/);
+              const highlightIdx = Math.floor(listenAudioProgress * paraWords.length);
+              return paraWords.map((w, i) =>
+                e('span', {
+                  key: i,
+                  ref: (isListenPlaying && i === highlightIdx) ? (el) => {
+                    // Auto-scroll highlighted word into view
+                    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                  } : undefined,
+                  className: 'listen-word' + (isListenPlaying && i === highlightIdx ? ' active' : ''),
+                  style: {
+                    opacity: isListenPlaying ? (i < highlightIdx ? 0.5 : i === highlightIdx ? 1 : 0.85) : 1,
+                    transition: 'opacity 0.15s, background-color 0.1s',
+                    fontWeight: isListenPlaying && i === highlightIdx ? '600' : '400',
+                  }
+                }, w + (i < paraWords.length - 1 ? ' ' : ''))
+              );
+            })()),
+          ),
           
           // Audio progress bar
           (isListenPlaying || listenAudioProgress > 0) && e('div', {
             key: 'audio-progress',
-            style: { width: '80%', maxWidth: '20rem', height: '3px', borderRadius: '2px', background: theme.cardBorder, marginTop: '1rem', overflow: 'hidden' }
+            style: { width: '80%', maxWidth: '20rem', height: '3px', borderRadius: '2px', background: theme.cardBorder, marginTop: '1rem', overflow: 'hidden', flexShrink: 0 }
           }, e('div', { style: { height: '100%', width: (listenAudioProgress * 100) + '%', background: theme.accent, transition: 'width 0.15s' } })),
         ]);
       };
@@ -3262,7 +3353,7 @@
                   style: { width: '8rem', height: '4px', borderRadius: '2px', backgroundColor: theme.cardBorder, cursor: 'pointer' },
                 }),
               ]),
-              e('div', { key: 'quality', className: 'settings-row' }, [
+              !IS_MOBILE && e('div', { key: 'quality', className: 'settings-row' }, [
                 e('span', { key: 'ql', className: 'settings-row-label' }, 'Model Quality'),
                 e('select', {
                   key: 'qsel',
@@ -3284,9 +3375,11 @@
                   e('option', { key: 'q4f16', value: 'q4f16' }, 'q4f16 — Smallest, experimental'),
                 ]),
               ]),
-              (modelStatus === 'ready' && ttsManager._loadedDtype !== modelQuality) && e('div', { key: 'reload-note', style: { fontSize: '0.6875rem', color: theme.accent, marginTop: '0.25rem' } },
+              IS_MOBILE && e('div', { key: 'quality-mobile', style: { fontSize: '0.6875rem', color: theme.muted, marginTop: '0.25rem' } },
+                'Mobile requires fp32 (~330MB) for audio playback'),
+              (modelStatus === 'ready' && ttsManager._loadedDtype !== modelQuality && !IS_MOBILE) && e('div', { key: 'reload-note', style: { fontSize: '0.6875rem', color: theme.accent, marginTop: '0.25rem' } },
                 'Tap Play to reload model with new quality'),
-              modelStatus === 'ready' && ttsManager._loadedDtype === modelQuality && e('div', { key: 'status', style: { fontSize: '0.6875rem', color: theme.muted, marginTop: '0.25rem' } },
+              modelStatus === 'ready' && e('div', { key: 'status', style: { fontSize: '0.6875rem', color: theme.muted, marginTop: '0.25rem' } },
                 '\u2713 Voice model loaded (' + (ttsManager._loadedDtype || '?') + ')'),
             ]),
             
