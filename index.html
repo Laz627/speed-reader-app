@@ -2569,13 +2569,56 @@
           const para = paragraphRanges[listenParagraphIdx];
           if (!para || cancelled) return;
           
-          debugLog('[PLAY] Para ' + (listenParagraphIdx + 1) + '/' + paragraphRanges.length + ': "' + para.text.substring(0, 60) + '..."');
-          setIsGenerating(true);
           const paraKey = chapterIndex + ':' + listenParagraphIdx;
           
+          // On mobile, first paragraph: wait for pre-gen to build a buffer.
+          // This prevents lockstep where play consumes cache as fast as pre-gen fills it.
+          if (IS_MOBILE && listenParagraphIdx === 0) {
+            setIsGenerating(true);
+            const bufferTarget = Math.min(8, paragraphRanges.length); // Wait for 8 paragraphs
+            const maxWait = 60000; // Give up after 60s
+            const started = Date.now();
+            
+            debugLog('[BUFFER] Waiting for ' + bufferTarget + ' paragraphs to cache...');
+            
+            while (!cancelled) {
+              let cached = 0;
+              for (let i = 0; i < bufferTarget; i++) {
+                if (ttsManager._preCache[chapterIndex + ':' + i]) cached++;
+              }
+              if (cached >= bufferTarget) {
+                debugLog('[BUFFER] Ready — ' + cached + ' paragraphs cached (' + Math.round((Date.now() - started) / 1000) + 's)');
+                break;
+              }
+              if (Date.now() - started > maxWait) {
+                debugLog('[BUFFER] Timeout — ' + cached + '/' + bufferTarget + ' cached, starting anyway');
+                break;
+              }
+              await new Promise(r => setTimeout(r, 500));
+            }
+            if (cancelled) return;
+          }
+          
+          debugLog('[PLAY] Para ' + (listenParagraphIdx + 1) + '/' + paragraphRanges.length + ': "' + para.text.substring(0, 60) + '..."');
+          setIsGenerating(true);
+          
           try {
-            // Check cache (may need to wait if pre-gen is currently generating this paragraph)
-            const pregenBuffer = await ttsManager.getPregen(paraKey);
+            // Check cache — wait briefly if pre-gen is working on it
+            let pregenBuffer = await ttsManager.getPregen(paraKey);
+            
+            // If not cached, wait for pre-gen loop to catch up (up to 120s)
+            if (!pregenBuffer && IS_MOBILE) {
+              debugLog('[PLAY] Waiting for pre-gen: para ' + (listenParagraphIdx + 1));
+              const waitStart = Date.now();
+              while (!cancelled && Date.now() - waitStart < 120000) {
+                if (ttsManager._preCache[paraKey]) {
+                  pregenBuffer = ttsManager._preCache[paraKey];
+                  debugLog('[PLAY] Pre-gen arrived after ' + Math.round((Date.now() - waitStart) / 1000) + 's');
+                  break;
+                }
+                await new Promise(r => setTimeout(r, 300));
+              }
+            }
             
             if (pregenBuffer) {
               debugLog('[TTS] ✓ Playing from pre-gen cache: para ' + (listenParagraphIdx + 1));
