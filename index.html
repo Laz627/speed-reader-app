@@ -1178,16 +1178,26 @@
           const KokoroTTS = kokoroModule.KokoroTTS;
           if (!KokoroTTS) throw new Error('KokoroTTS not found in kokoro-js');
           
-          // fp32 for WebGPU (required — q8 garbles output on GPU)
-          // q8 for WASM fallback (smaller, fast enough on CPU)
+          // Device selection strategy:
+          // - Mobile: ALWAYS use wasm/q8 — fp32+WebGPU causes GPU memory pressure,
+          //   distortion, and crashes on sustained generation. q8+WASM is stable.
+          // - Desktop: Use webgpu/fp32 if available — fast and stable with more VRAM.
+          const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)
+            || (navigator.maxTouchPoints > 0 && window.innerWidth < 1024);
+          
           let device = 'wasm';
           let dtype = 'q8';
-          try {
-            if (navigator.gpu) {
-              const adapter = await navigator.gpu.requestAdapter();
-              if (adapter) { device = 'webgpu'; dtype = 'fp32'; }
-            }
-          } catch(e) { console.log('WebGPU not available, using WASM/q8'); }
+          
+          if (!isMobile) {
+            try {
+              if (navigator.gpu) {
+                const adapter = await navigator.gpu.requestAdapter();
+                if (adapter) { device = 'webgpu'; dtype = 'fp32'; }
+              }
+            } catch(e) { console.log('WebGPU not available, using WASM/q8'); }
+          } else {
+            console.log('[TTS] Mobile detected — using WASM/q8 for stability');
+          }
           
           this._currentDevice = device;
           console.log('[TTS] Loading Kokoro: ' + device + '/' + dtype);
