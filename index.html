@@ -1500,23 +1500,23 @@
           this.gainNode = this.audioContext.createGain();
           this.gainNode.connect(this.audioContext.destination);
           
-          if (this.onStatusChange) this.onStatusChange('loading', 30);
-          if (onProgress) onProgress(30);
+          if (this.onStatusChange) this.onStatusChange('loading', 50);
+          if (onProgress) onProgress(50);
           
-          // Quick connectivity test — hit the API info endpoint
-          debugLog('[HF] Testing connectivity to ' + this.HF_BASE + '...');
-          const infoRes = await fetch(this.HF_BASE + '/gradio_api/info');
-          debugLog('[HF] API info: HTTP ' + infoRes.status);
-          if (!infoRes.ok) throw new Error('HF Space returned HTTP ' + infoRes.status);
+          // Quick smoke test — POST a short phrase to /call/predict
+          // (We skip /gradio_api/info because HF returns 403 on cross-origin GET to that endpoint)
+          debugLog('[HF] Smoke test: POST /call/predict...');
+          const testRes = await fetch(this.HF_BASE + '/gradio_api/call/predict', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ data: ['Test.', 'af_heart', 1.0] })
+          });
           
-          if (this.onStatusChange) this.onStatusChange('loading', 70);
-          if (onProgress) onProgress(70);
+          debugLog('[HF] Smoke test: HTTP ' + testRes.status);
+          if (!testRes.ok) throw new Error('HF Space returned HTTP ' + testRes.status);
           
-          // Verify /predict endpoint exists
-          const info = await infoRes.json();
-          const hasPredict = info.named_endpoints && info.named_endpoints['/predict'];
-          debugLog('[HF] /predict endpoint available: ' + !!hasPredict);
-          if (!hasPredict) throw new Error('Space missing /predict endpoint — is it fully loaded?');
+          const testData = await testRes.json();
+          debugLog('[HF] Smoke test OK, event_id: ' + (testData.event_id || 'none'));
           
           if (this.onStatusChange) this.onStatusChange('loading', 100);
           if (onProgress) onProgress(100);
