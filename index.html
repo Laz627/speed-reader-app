@@ -1167,47 +1167,25 @@
           this.gainNode = this.audioContext.createGain();
           this.gainNode.connect(this.audioContext.destination);
           
-          // Ping the HF Space to wake it up (spaces sleep after inactivity).
-          // This is the ~30s wait on cold start. Once awake, it stays up.
-          console.log('[TTS] Waking up HuggingFace Space...');
-          if (this.onStatusChange) this.onStatusChange('loading', 10);
+          // Quick connectivity check — just verify the space URL is reachable.
+          // Don't wait for a full generation. If the space is asleep,
+          // the first real sentence generation in streamParagraph() will
+          // handle the ~30s cold start naturally (the "Generating..." UI
+          // is already shown during that wait).
+          console.log('[TTS] Checking HuggingFace Space...');
+          if (this.onStatusChange) this.onStatusChange('loading', 30);
           
-          const wakeStart = Date.now();
-          let awake = false;
-          for (let attempt = 0; attempt < 60; attempt++) { // Up to 60s timeout
-            try {
-              const res = await fetch(HF_SPACE + '/gradio_api/queue/join', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  data: ['Wake up test.', 'af_heart', 1.0, false],
-                  fn_index: 4,
-                  session_hash: this._session,
-                }),
-              });
-              if (res.ok) {
-                const { event_id } = await res.json();
-                // Wait for the result to confirm the space is processing
-                await this._waitForResult(event_id);
-                awake = true;
-                break;
-              }
-            } catch(e) {
-              // Space probably still waking — retry
-            }
-            const elapsed = (Date.now() - wakeStart) / 1000;
-            const pct = Math.min(90, Math.round((elapsed / 30) * 80) + 10);
-            if (this.onStatusChange) this.onStatusChange('loading', pct);
-            if (this.onProgressChange) this.onProgressChange(pct);
-            await new Promise(r => setTimeout(r, 2000));
+          const checkRes = await fetch(HF_SPACE + '/gradio_api/info', { signal: AbortSignal.timeout(15000) }).catch(() => null);
+          if (!checkRes) {
+            // Space might be sleeping — that's fine, first generate will wake it.
+            console.log('[TTS] Space may be sleeping — will wake on first generate');
           }
           
-          if (!awake) throw new Error('HuggingFace Space did not respond after 60s');
+          if (this.onStatusChange) this.onStatusChange('loading', 90);
           
           this.status = 'ready';
           if (this.onStatusChange) this.onStatusChange('ready', 100);
-          const elapsed = ((Date.now() - wakeStart) / 1000).toFixed(1);
-          console.log('[TTS] Ready (HuggingFace Space, ' + elapsed + 's wake time)');
+          console.log('[TTS] Ready (HuggingFace Space API)');
         } catch (err) {
           console.error('[TTS] Init failed:', err);
           this.status = 'error';
