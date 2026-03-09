@@ -1114,12 +1114,28 @@
     const WORKER_CODE = `
       let tts = null;
       
+      // Simple sentence splitter for chunked generation
+      function splitSentences(text) {
+        const raw = text.match(/[^.!?]*[.!?]+["\\u201D\\u2019'"]*\\s*/g);
+        if (!raw || raw.length === 0) return [text];
+        // Merge very short sentences with previous
+        const merged = [];
+        for (const s of raw) {
+          if (merged.length > 0 && s.trim().length < 30) {
+            merged[merged.length - 1] += s;
+          } else {
+            merged.push(s);
+          }
+        }
+        return merged.filter(s => s.trim().length > 0);
+      }
+      
       self.onmessage = async (e) => {
         const { type, id, payload } = e.data;
         
         if (type === 'init') {
           try {
-            // Detect WebGPU inside the Worker where GPU context lives
+            // Detect WebGPU inside the Worker
             let device = 'wasm';
             let dtype = 'q8';
             try {
@@ -1130,7 +1146,6 @@
             } catch(e) {}
             
             const config = device + '/' + dtype;
-            console.log('[Worker] Loading Kokoro: ' + config);
             
             const mod = await import('https://cdn.jsdelivr.net/npm/kokoro-js@1/+esm');
             tts = await mod.KokoroTTS.from_pretrained(
@@ -1151,85 +1166,66 @@
           }
         }
         
-        if (type === 'stream') {
+        if (type === 'generate') {
+          // Generate a single sentence/chunk — returns audio samples
+          if (!tts) { self.postMessage({ type: 'gen-error', id, error: 'Not loaded' }); return; }
+          try {
+            const result = await tts.generate(payload.text, {
+              voice: payload.voice || 'af_heart',
+              speed: payload.speed || 1.0,
+            });
+            
+            // Extract Float32Array from result
+            let raw = null;
+            let sr = 24000;
+            const a = result.audio !== undefined ? result.audio : result;
+            if (a instanceof Float32Array) { raw = a; }
+            else if (a && a.audio instanceof Float32Array) { raw = a.audio; sr = a.sampling_rate || sr; }
+            else if (a && a.data) { raw = new Float32Array(a.data); }
+            else if (a && a.audio && a.audio.data) { raw = new Float32Array(a.audio.data); sr = a.sampling_rate || sr; }
+            if (result.sampling_rate) sr = result.sampling_rate;
+            
+            self.postMessage({
+              type: 'gen-done', id,
+              samples: raw ? Array.from(raw) : [],
+              sampleRate: sr,
+            });
+          } catch(err) {
+            self.postMessage({ type: 'gen-error', id, error: err.message });
+          }
+        }
+        
+        if (type === 'stream-para') {
+          // Split paragraph into sentences, generate each, send chunks back
           if (!tts) { self.postMessage({ type: 'stream-error', id, error: 'Not loaded' }); return; }
           try {
-            const stream = tts.stream(payload.text, { voice: payload.voice, speed: payload.speed });
-            let idx = 0;
-            for await (const chunk of stream) {
-              // Comprehensive audio extraction from stream() chunks.
-              // The shape varies by kokoro-js version and device backend.
+            const sentences = splitSentences(payload.text);
+            for (let i = 0; i < sentences.length; i++) {
+              const s = sentences[i].trim();
+              if (s.length < 2) continue;
+              
+              const result = await tts.generate(s, {
+                voice: payload.voice || 'af_heart',
+                speed: payload.speed || 1.0,
+              });
+              
               let raw = null;
               let sr = 24000;
-              let debugInfo = '';
-              
-              try {
-                const a = chunk.audio;
-                debugInfo = 'audio type=' + typeof a;
-                
-                if (!a) {
-                  debugInfo += ' (null/undefined)';
-                } else if (a instanceof Float32Array) {
-                  raw = a;
-                  debugInfo = 'Float32Array direct';
-                } else if (a.audio instanceof Float32Array) {
-                  // RawAudio wrapper: { audio: Float32Array, sampling_rate: N }
-                  raw = a.audio;
-                  sr = a.sampling_rate || sr;
-                  debugInfo = 'RawAudio wrapper';
-                } else if (a.data instanceof Float32Array) {
-                  // Tensor: { data: Float32Array, dims: [...] }
-                  raw = a.data;
-                  debugInfo = 'Tensor .data';
-                } else if (a.audio?.data instanceof Float32Array) {
-                  // Double-wrapped: { audio: { data: Float32Array } }
-                  raw = a.audio.data;
-                  sr = a.sampling_rate || sr;
-                  debugInfo = 'Nested Tensor';
-                } else if (a.audio?.data) {
-                  // Tensor with non-typed data
-                  raw = new Float32Array(a.audio.data);
-                  sr = a.sampling_rate || sr;
-                  debugInfo = 'Nested data array';
-                } else if (a.data) {
-                  raw = new Float32Array(a.data);
-                  debugInfo = 'data array';
-                } else if (typeof a.toFloat32Array === 'function') {
-                  raw = a.toFloat32Array();
-                  debugInfo = 'toFloat32Array()';
-                } else if (Array.isArray(a)) {
-                  raw = new Float32Array(a);
-                  debugInfo = 'plain array';
-                } else {
-                  // Last resort: try to enumerate what we have
-                  const keys = Object.keys(a).join(',');
-                  const proto = Object.getPrototypeOf(a)?.constructor?.name || 'unknown';
-                  debugInfo = 'unknown: keys=[' + keys + '] proto=' + proto;
-                  // Try accessing by common property names
-                  if (a.waveform instanceof Float32Array) { raw = a.waveform; debugInfo = 'waveform'; }
-                  else if (a.samples instanceof Float32Array) { raw = a.samples; debugInfo = 'samples'; }
-                  else if (a.buffer instanceof Float32Array) { raw = a.buffer; debugInfo = 'buffer'; }
-                }
-                
-                // Also check chunk-level sampling_rate
-                if (chunk.sampling_rate) sr = chunk.sampling_rate;
-                
-              } catch(ex) {
-                debugInfo = 'extraction error: ' + ex.message;
-              }
-              
-              const samples = raw && raw.length > 0 ? Array.from(raw) : [];
+              const a = result.audio !== undefined ? result.audio : result;
+              if (a instanceof Float32Array) { raw = a; }
+              else if (a && a.audio instanceof Float32Array) { raw = a.audio; sr = a.sampling_rate || sr; }
+              else if (a && a.data) { raw = new Float32Array(a.data); }
+              else if (a && a.audio && a.audio.data) { raw = new Float32Array(a.audio.data); sr = a.sampling_rate || sr; }
+              if (result.sampling_rate) sr = result.sampling_rate;
               
               self.postMessage({
-                type: 'chunk', id, idx,
-                samples: samples,
+                type: 'chunk', id, idx: i,
+                samples: raw && raw.length > 0 ? Array.from(raw) : [],
                 sampleRate: sr,
-                text: (chunk.text || '').substring(0, 50),
-                debug: debugInfo,
+                text: s.substring(0, 50),
               });
-              idx++;
             }
-            self.postMessage({ type: 'stream-end', id, total: idx });
+            self.postMessage({ type: 'stream-end', id, total: sentences.length });
           } catch(err) {
             self.postMessage({ type: 'stream-error', id, error: err.message });
           }
@@ -1396,7 +1392,7 @@
         this._estDuration = (text.split(/\s+/).length / 150) * 60 / (speed || 1.0);
         this._streamId++;
         this.worker.postMessage({
-          type: 'stream', id: this._streamId,
+          type: 'stream-para', id: this._streamId,
           payload: { text, voice: voice || 'af_heart', speed: speed || 1.0 },
         });
       }
@@ -1432,7 +1428,7 @@
           };
           this._pregenCallbacks[id] = entry;
           this.worker.postMessage({
-            type: 'stream', id,
+            type: 'stream-para', id,
             payload: { text, voice: voice || 'af_heart', speed: speed || 1.0 },
           });
         });
