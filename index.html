@@ -1167,23 +1167,10 @@
           this.gainNode = this.audioContext.createGain();
           this.gainNode.connect(this.audioContext.destination);
           
-          // Load the Gradio JS client (official library for calling HF Spaces)
-          console.log('[TTS] Loading Gradio client...');
-          if (this.onStatusChange) this.onStatusChange('loading', 20);
-          
-          const { Client } = await import('https://esm.sh/@gradio/client');
-          
-          // Connect to the Kokoro TTS space
-          console.log('[TTS] Connecting to HuggingFace Space...');
-          if (this.onStatusChange) this.onStatusChange('loading', 40);
-          
-          this._client = await Client.connect('hexgrad/Kokoro-TTS');
-          
           if (this.onStatusChange) this.onStatusChange('loading', 90);
-          
           this.status = 'ready';
           if (this.onStatusChange) this.onStatusChange('ready', 100);
-          console.log('[TTS] Ready (Gradio client → hexgrad/Kokoro-TTS)');
+          console.log('[TTS] Ready');
         } catch (err) {
           console.error('[TTS] Init failed:', err);
           this.status = 'error';
@@ -1193,58 +1180,64 @@
       }
       
       // ============================================================
-      // GRADIO CLIENT API: submit job → wait for result → fetch audio
-      // The @gradio/client library handles SSE, CORS, queuing, and
-      // file URL construction — all the stuff that broke on mobile
-      // when we tried to do it manually.
+      // HF SPACE API: queue/join POST → fetch SSE response as text → parse → fetch audio WAV
+      // No EventSource, no ReadableStream, no Gradio client.
+      // Just two plain fetch() calls that work on every mobile browser.
       // ============================================================
       
-      // Generate audio for a text chunk via HF Space API
-      // Returns AudioBuffer ready for playback
       async _generateChunk(text, voice, speed) {
-        console.log('[TTS] Generating: "' + text.substring(0, 40) + '..."');
+        const session = Math.random().toString(36).slice(2, 12);
         
-        // fn_index 4 = generate(text, voice, speed, use_gpu)
-        // use_gpu=false for CPU fallback (reliable for anonymous users)
-        const result = await new Promise((resolve, reject) => {
-          try {
-            const job = this._client.submit(4, [text, voice || 'af_heart', speed || 1.0, false]);
-            const timeout = setTimeout(() => reject(new Error('TTS timeout (90s)')), 90000);
-            
-            job.on('data', (data) => { 
-              clearTimeout(timeout); 
-              console.log('[TTS] Got audio data');
-              resolve(data); 
-            });
-            
-            job.on('error', (err) => { 
-              clearTimeout(timeout); 
-              console.error('[TTS] Job error:', err);
-              reject(new Error('TTS job error: ' + (err?.message || String(err)))); 
-            });
-            
-            job.on('status', (s) => {
-              if (s.stage === 'error') {
-                clearTimeout(timeout);
-                reject(new Error('TTS status error: ' + (s.message || 'unknown')));
-              } else {
-                console.log('[TTS] Job status:', s.stage, s.message || '');
-              }
-            });
-          } catch(e) {
-            reject(new Error('Failed to submit TTS job: ' + e.message));
-          }
+        // Step 1: Join the queue (regular POST, returns JSON)
+        const joinRes = await fetch(HF_SPACE + '/gradio_api/queue/join', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            data: [text, voice || 'af_heart', speed || 1.0, false],
+            fn_index: 4,
+            session_hash: session,
+          }),
         });
+        if (!joinRes.ok) throw new Error('Queue join failed: HTTP ' + joinRes.status);
+        const joinData = await joinRes.json();
+        console.log('[TTS] Queued:', joinData.event_id);
         
-        // result.data is [audioFileData, phonemeText]
-        const audioData = result?.data?.[0];
-        if (!audioData?.url) {
-          throw new Error('No audio URL in response: ' + JSON.stringify(result?.data?.slice?.(0,1)));
+        // Step 2: Fetch the SSE endpoint as a regular request.
+        // Don't stream it — just await the full text response.
+        // The server processes the audio (~0.5-2s), sends SSE events,
+        // then closes the connection. We read it all at once.
+        const sseRes = await fetch(
+          HF_SPACE + '/gradio_api/queue/data?session_hash=' + session
+        );
+        if (!sseRes.ok) throw new Error('SSE fetch failed: HTTP ' + sseRes.status);
+        const sseText = await sseRes.text();
+        
+        // Step 3: Parse the SSE text to find the process_completed event
+        let audioUrl = null;
+        for (const line of sseText.split('\n')) {
+          if (!line.startsWith('data: ')) continue;
+          try {
+            const evt = JSON.parse(line.slice(6));
+            if (evt.msg === 'process_completed' && evt.success) {
+              const fileData = evt.output?.data?.[0];
+              audioUrl = fileData?.url || (fileData?.path ? HF_SPACE + '/gradio_api/file=' + fileData.path : null);
+              break;
+            }
+            if (evt.msg === 'process_completed' && !evt.success) {
+              throw new Error('Server error: ' + (evt.output?.error || 'generation failed'));
+            }
+          } catch(e) {
+            if (e.message.startsWith('Server error')) throw e;
+            // Skip non-JSON lines
+          }
         }
         
+        if (!audioUrl) throw new Error('No audio in response. Raw: ' + sseText.substring(0, 200));
+        
+        // Step 4: Fetch the WAV and decode
         console.log('[TTS] Fetching audio...');
-        const wavRes = await fetch(audioData.url);
-        if (!wavRes.ok) throw new Error('Failed to fetch audio: ' + wavRes.status);
+        const wavRes = await fetch(audioUrl);
+        if (!wavRes.ok) throw new Error('Audio fetch failed: HTTP ' + wavRes.status);
         const arrayBuf = await wavRes.arrayBuffer();
         return await this.audioContext.decodeAudioData(arrayBuf);
       }
