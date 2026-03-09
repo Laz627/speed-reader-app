@@ -448,6 +448,14 @@
 </head>
 <body>
   <div id="root"><div style="display:flex;align-items:center;justify-content:center;min-height:100vh;color:#666;">Loading...</div></div>
+  
+  <!-- Debug overlay for mobile diagnostics -->
+  <div id="debug-overlay" style="display:none;position:fixed;bottom:0;left:0;right:0;height:35vh;background:rgba(0,0,0,0.92);color:#0f0;font-family:monospace;font-size:10px;line-height:1.4;overflow-y:auto;z-index:9999;padding:8px;white-space:pre-wrap;word-break:break-all;border-top:2px solid #0f0;"></div>
+  <button id="debug-toggle" onclick="var el=document.getElementById('debug-overlay');el.style.display=el.style.display==='none'?'block':'none';" style="position:fixed;bottom:8px;right:8px;z-index:10000;background:#111;color:#0f0;border:1px solid #0f0;border-radius:4px;padding:4px 8px;font-family:monospace;font-size:11px;opacity:0.7;cursor:pointer;">DBG</button>
+  
+  <!-- Eruda mobile console (full DevTools on mobile) -->
+  <script src="https://cdn.jsdelivr.net/npm/eruda"></script>
+  <script>if (typeof eruda !== 'undefined') eruda.init();</script>
   <noscript><div style="padding:2rem;text-align:center;color:#ef4444;">JavaScript is required to run this app.</div></noscript>
   
   <!-- React -->
@@ -468,6 +476,63 @@
       throw new Error('JSZip not loaded');
     }
 
+    // ============================================================
+    // DEBUG OVERLAY (for mobile diagnostics)
+    // ============================================================
+    
+    const _debugLines = [];
+    const _origLog = console.log;
+    const _origErr = console.error;
+    const _origWarn = console.warn;
+    
+    function debugLog(...args) {
+      const msg = args.map(a => typeof a === 'object' ? JSON.stringify(a).substring(0, 200) : String(a)).join(' ');
+      const ts = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      _debugLines.push(ts + ' ' + msg);
+      if (_debugLines.length > 100) _debugLines.shift();
+      _origLog('[DBG]', ...args);
+      const el = document.getElementById('debug-overlay');
+      if (el) {
+        el.textContent = _debugLines.slice(-30).join('\n');
+        el.scrollTop = el.scrollHeight;
+      }
+    }
+    
+    // Capture all console output into debug overlay
+    console.log = (...args) => { _origLog(...args); debugLog(...args); };
+    console.error = (...args) => {
+      _origErr(...args);
+      const msg = args.map(a => {
+        if (a instanceof Error) return a.message + '\n' + (a.stack || '').substring(0, 200);
+        if (typeof a === 'object') return JSON.stringify(a).substring(0, 200);
+        return String(a);
+      }).join(' ');
+      _debugLines.push(new Date().toLocaleTimeString('en-US', { hour12: false }) + ' ❌ ' + msg);
+      const el = document.getElementById('debug-overlay');
+      if (el) { el.textContent = _debugLines.slice(-30).join('\n'); el.scrollTop = el.scrollHeight; }
+    };
+    console.warn = (...args) => {
+      _origWarn(...args);
+      const msg = args.map(a => typeof a === 'object' ? JSON.stringify(a).substring(0, 200) : String(a)).join(' ');
+      _debugLines.push(new Date().toLocaleTimeString('en-US', { hour12: false }) + ' ⚠️ ' + msg);
+      const el = document.getElementById('debug-overlay');
+      if (el) { el.textContent = _debugLines.slice(-30).join('\n'); el.scrollTop = el.scrollHeight; }
+    };
+    
+    // ============================================================
+    // MOBILE DETECTION
+    // ============================================================
+    
+    const IS_MOBILE = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+    const HAS_WEBGPU = !!navigator.gpu;
+    
+    // On mobile, WebGPU produces garbled audio (transformers.js bug #1320).
+    // WASM works but is too slow for continuous reading.
+    // So on mobile we route to HF Space API for server-side inference.
+    const USE_HF_SPACE = IS_MOBILE;
+    
+    debugLog('Platform: ' + (IS_MOBILE ? 'MOBILE' : 'DESKTOP') + ', WebGPU: ' + HAS_WEBGPU + ', TTS backend: ' + (USE_HF_SPACE ? 'HF Space API' : 'Local kokoro-js'));
+    
     // ============================================================
     // CONSTANTS & SPECIAL MARKERS
     // ============================================================
@@ -1113,22 +1178,13 @@
     // No Worker needed — WebGPU per-sentence latency is sub-frame.
     // ============================================================
     
-    // ============================================================
-    // KOKORO TTS MANAGER — HuggingFace Space API Backend
-    // Uses hexgrad/Kokoro-TTS public Gradio space for inference.
-    // Same Kokoro model, same voices, same quality — runs on HF GPUs.
-    // Phone just plays audio, no local inference needed.
-    // Zero cost — the public space is free.
-    // ============================================================
-    
-    const HF_SPACE = 'https://hexgrad-kokoro-tts.hf.space';
-    
     class KokoroTTSManager {
       constructor() {
+        this.tts = null;
         this.audioContext = null;
         this.currentSource = null;
         this.gainNode = null;
-        this.status = 'idle';  // idle | loading | ready | error
+        this.status = 'idle';
         this.loadProgress = 0;
         this.onStatusChange = null;
         this.onProgressChange = null;
@@ -1149,9 +1205,6 @@
         // Pre-gen cache
         this._preCache = {};
         this._prePromises = {};
-        
-        // Session hash for Gradio queue API
-        this._session = Math.random().toString(36).slice(2, 12);
       }
       
       async init(onProgress) {
@@ -1162,15 +1215,45 @@
         if (this.onStatusChange) this.onStatusChange('loading', 0);
         
         try {
-          // Set up audio output
+          const mod = await import('https://cdn.jsdelivr.net/npm/kokoro-js@1/+esm');
+          const KokoroTTS = mod.KokoroTTS;
+          if (!KokoroTTS) throw new Error('KokoroTTS not found');
+          
+          // q8 + webgpu: 86MB model, WebGPU-accelerated inference.
+          // Per TLD2 production guide: q8 on WebGPU is "indistinguishable from fp32
+          // in blind listening tests" with 150-600ms per sentence latency.
+          let device = 'wasm';
+          try {
+            if (navigator.gpu) {
+              const adapter = await navigator.gpu.requestAdapter();
+              if (adapter) device = 'webgpu';
+            }
+          } catch(e) {}
+          
+          console.log('[TTS] Loading: q8/' + device);
+          
+          this.tts = await KokoroTTS.from_pretrained(
+            'onnx-community/Kokoro-82M-v1.0-ONNX',
+            {
+              dtype: 'q8',
+              device,
+              progress_callback: (p) => {
+                if (p.status === 'progress' && p.progress != null) {
+                  this.loadProgress = p.progress;
+                  if (this.onStatusChange) this.onStatusChange('loading', p.progress);
+                  if (this.onProgressChange) this.onProgressChange(p.progress);
+                }
+              },
+            }
+          );
+          
           this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
           this.gainNode = this.audioContext.createGain();
           this.gainNode.connect(this.audioContext.destination);
           
-          if (this.onStatusChange) this.onStatusChange('loading', 90);
           this.status = 'ready';
           if (this.onStatusChange) this.onStatusChange('ready', 100);
-          console.log('[TTS] Ready');
+          console.log('[TTS] Ready (q8/' + device + ')');
         } catch (err) {
           console.error('[TTS] Init failed:', err);
           this.status = 'error';
@@ -1179,71 +1262,31 @@
         }
       }
       
-      // ============================================================
-      // HF SPACE API: queue/join POST → fetch SSE response as text → parse → fetch audio WAV
-      // No EventSource, no ReadableStream, no Gradio client.
-      // Just two plain fetch() calls that work on every mobile browser.
-      // ============================================================
-      
-      async _generateChunk(text, voice, speed) {
-        const session = Math.random().toString(36).slice(2, 12);
+      // Convert any audio result shape to AudioBuffer
+      _toBuf(result) {
+        let raw = null, sr = 24000;
+        const a = result.audio !== undefined ? result.audio : result;
+        // Float32Array direct
+        if (a instanceof Float32Array) { raw = a; }
+        // RawAudio: { audio: Float32Array, sampling_rate }
+        else if (a && a.audio instanceof Float32Array) { raw = a.audio; sr = a.sampling_rate || sr; }
+        // Tensor: { data: Float32Array }
+        else if (a && a.data instanceof Float32Array) { raw = a.data; }
+        // Nested: { audio: { data: Float32Array } }
+        else if (a && a.audio && a.audio.data) { raw = new Float32Array(a.audio.data); sr = a.sampling_rate || sr; }
+        // Other typed array
+        else if (ArrayBuffer.isView(a)) { raw = new Float32Array(a.buffer); }
         
-        // Step 1: Join the queue (regular POST, returns JSON)
-        const joinRes = await fetch(HF_SPACE + '/gradio_api/queue/join', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            data: [text, voice || 'af_heart', speed || 1.0, false],
-            fn_index: 4,
-            session_hash: session,
-          }),
-        });
-        if (!joinRes.ok) throw new Error('Queue join failed: HTTP ' + joinRes.status);
-        const joinData = await joinRes.json();
-        console.log('[TTS] Queued:', joinData.event_id);
+        if (result.sampling_rate) sr = result.sampling_rate;
+        if (!raw || raw.length === 0) return null;
         
-        // Step 2: Fetch the SSE endpoint as a regular request.
-        // Don't stream it — just await the full text response.
-        // The server processes the audio (~0.5-2s), sends SSE events,
-        // then closes the connection. We read it all at once.
-        const sseRes = await fetch(
-          HF_SPACE + '/gradio_api/queue/data?session_hash=' + session
-        );
-        if (!sseRes.ok) throw new Error('SSE fetch failed: HTTP ' + sseRes.status);
-        const sseText = await sseRes.text();
-        
-        // Step 3: Parse the SSE text to find the process_completed event
-        let audioUrl = null;
-        for (const line of sseText.split('\n')) {
-          if (!line.startsWith('data: ')) continue;
-          try {
-            const evt = JSON.parse(line.slice(6));
-            if (evt.msg === 'process_completed' && evt.success) {
-              const fileData = evt.output?.data?.[0];
-              audioUrl = fileData?.url || (fileData?.path ? HF_SPACE + '/gradio_api/file=' + fileData.path : null);
-              break;
-            }
-            if (evt.msg === 'process_completed' && !evt.success) {
-              throw new Error('Server error: ' + (evt.output?.error || 'generation failed'));
-            }
-          } catch(e) {
-            if (e.message.startsWith('Server error')) throw e;
-            // Skip non-JSON lines
-          }
-        }
-        
-        if (!audioUrl) throw new Error('No audio in response. Raw: ' + sseText.substring(0, 200));
-        
-        // Step 4: Fetch the WAV and decode
-        console.log('[TTS] Fetching audio...');
-        const wavRes = await fetch(audioUrl);
-        if (!wavRes.ok) throw new Error('Audio fetch failed: HTTP ' + wavRes.status);
-        const arrayBuf = await wavRes.arrayBuffer();
-        return await this.audioContext.decodeAudioData(arrayBuf);
+        const buf = this.audioContext.createBuffer(1, raw.length, sr);
+        buf.copyToChannel(raw, 0);
+        return buf;
       }
       
       // ============================================================
-      // SENTENCE-LEVEL PLAYBACK: API call per sentence + audio queue
+      // SENTENCE-LEVEL PLAYBACK: generate() per sentence + audio queue
       // ============================================================
       
       async streamParagraph(text, voice, speed, onFirst, onDone) {
@@ -1255,8 +1298,12 @@
         let n = 0, firstSent = false;
         
         try {
-          // Sentence splitting — same approach as original
+          // Manual sentence splitting + generate() per sentence.
+          // tts.stream() hangs on mobile Chrome. generate() works everywhere.
+          // With q8+WebGPU, each generate() is ~150-600ms — fast enough
+          // for seamless queue-based playback without UI freezing.
           const sentences = text.match(/[^.!?]*[.!?]+["'"'\u201D\u2019]?\s*/g) || [text];
+          // Merge short fragments
           const chunks = [];
           for (const s of sentences) {
             if (chunks.length > 0 && s.trim().length < 30) {
@@ -1271,9 +1318,11 @@
             const trimmed = chunk.trim();
             if (trimmed.length < 2) continue;
             
-            const buf = await this._generateChunk(trimmed, voice, speed);
+            const result = await this.tts.generate(trimmed, { voice: voice || 'af_heart', speed: speed || 1.0 });
             if (this._cancelled) break;
-            if (!buf || buf.length === 0) { console.warn('[TTS] Empty result, skipping'); continue; }
+            
+            const buf = this._toBuf(result);
+            if (!buf) { console.warn('[TTS] Empty result, skipping'); continue; }
             
             n++;
             console.log('[TTS] Chunk ' + n + ': ' + buf.duration.toFixed(1) + 's | "' + trimmed.substring(0, 40) + '..."');
@@ -1281,6 +1330,7 @@
             
             if (!firstSent) { firstSent = true; if (onFirst) onFirst(); }
             
+            // Micro-yield between generate() calls — keeps UI responsive
             await new Promise(r => setTimeout(r, 0));
           }
         } catch(e) {
@@ -1289,13 +1339,6 @@
         
         this._allEnqueued = true;
         console.log('[TTS] Done: ' + n + ' chunks, ' + this._totalDur.toFixed(1) + 's audio');
-        // IMPORTANT: Only advance to next paragraph if we actually played something.
-        // If n === 0, generation failed — surface the error, don't cascade.
-        if (n === 0) {
-          console.warn('[TTS] No audio generated — NOT advancing paragraph');
-          this._onDone = null;
-          throw new Error('Voice generation failed — check your internet connection and try again');
-        }
         if (!this._playing && this._queue.length === 0 && this._onDone) this._onDone();
       }
       
@@ -1344,7 +1387,9 @@
         if (this._preCache[key] || this._prePromises[key]) return;
         this._prePromises[key] = (async () => {
           try {
-            const buf = await this._generateChunk(text, voice, speed);
+            // Use generate() for pre-gen (single call, whole paragraph)
+            const result = await this.tts.generate(text, { voice: voice || 'af_heart', speed: speed || 1.0 });
+            const buf = this._toBuf(result);
             if (buf) {
               this._preCache[key] = buf;
               console.log('[TTS] Pre-gen: ' + key + ' (' + buf.duration.toFixed(1) + 's)');
@@ -1395,11 +1440,448 @@
       }
       
       setVolume(v) { if (this.gainNode) this.gainNode.gain.value = Math.max(0, Math.min(1, v)); }
-      destroy() { this.fullStop(); if (this.audioContext) this.audioContext.close().catch(() => {}); this.status = 'idle'; }
+      destroy() { this.fullStop(); if (this.audioContext) this.audioContext.close().catch(() => {}); this.tts = null; this.status = 'idle'; }
     }
     
     // Singleton instance
     const kokoroManager = new KokoroTTSManager();
+
+
+    // ============================================================
+    // HF SPACE TTS MANAGER (server-side Kokoro via Gradio API)
+    // Same voice quality as local kokoro-js, but runs on HF's GPU.
+    // Used on mobile where local WebGPU produces garbled audio.
+    // ============================================================
+    
+    class HFSpaceTTSManager {
+      constructor() {
+        this.audioContext = null;
+        this.currentSource = null;
+        this.gainNode = null;
+        this.status = 'idle';
+        this.loadProgress = 0;
+        this.onStatusChange = null;
+        this.onProgressChange = null;
+        
+        // Playback queue (mirrors KokoroTTSManager)
+        this._queue = [];
+        this._playing = false;
+        this._onDone = null;
+        this._allEnqueued = false;
+        this._totalDur = 0;
+        this._playedDur = 0;
+        this._chunkStart = 0;
+        this._estDur = 0;
+        this._cancelled = false;
+        
+        // Pre-gen cache
+        this._preCache = {};
+        this._prePromises = {};
+        
+        this.HF_BASE = 'https://hexgrad-kokoro-tts.hf.space';
+      }
+      
+      // ============================================================
+      // INIT: Just set up AudioContext + connectivity check
+      // No model download needed — inference happens server-side
+      // ============================================================
+      
+      async init(onProgress) {
+        if (this.status === 'ready') return;
+        if (this.status === 'loading') return;
+        this.status = 'loading';
+        this.onProgressChange = onProgress;
+        if (this.onStatusChange) this.onStatusChange('loading', 0);
+        
+        try {
+          debugLog('[HF] Initializing AudioContext...');
+          this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+          this.gainNode = this.audioContext.createGain();
+          this.gainNode.connect(this.audioContext.destination);
+          
+          if (this.onStatusChange) this.onStatusChange('loading', 30);
+          if (onProgress) onProgress(30);
+          
+          // Quick connectivity test — join queue with a short phrase
+          debugLog('[HF] Testing connectivity to HF Space...');
+          const testSession = 'init_' + Math.random().toString(36).slice(2, 8);
+          const testRes = await fetch(this.HF_BASE + '/gradio_api/queue/join', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              data: ['Test.', 'af_heart', 1.0, false],
+              fn_index: 4,
+              session_hash: testSession
+            })
+          });
+          
+          debugLog('[HF] Connectivity test: HTTP ' + testRes.status);
+          if (!testRes.ok) throw new Error('HF Space returned HTTP ' + testRes.status);
+          
+          const testData = await testRes.json();
+          debugLog('[HF] Queue join OK, event_id: ' + (testData.event_id || 'none'));
+          
+          if (this.onStatusChange) this.onStatusChange('loading', 80);
+          if (onProgress) onProgress(80);
+          
+          // Read the test result to confirm full pipeline works
+          debugLog('[HF] Reading test result...');
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 15000);
+          
+          try {
+            const dataRes = await fetch(
+              this.HF_BASE + '/gradio_api/queue/data?session_hash=' + testSession,
+              { signal: controller.signal }
+            );
+            clearTimeout(timeout);
+            debugLog('[HF] Test data response: HTTP ' + dataRes.status + ', content-type: ' + (dataRes.headers.get('content-type') || 'none'));
+            
+            if (dataRes.ok) {
+              const sseText = await dataRes.text();
+              debugLog('[HF] Test SSE length: ' + sseText.length + ' chars');
+              const hasCompleted = sseText.includes('process_completed');
+              debugLog('[HF] Test completed: ' + hasCompleted);
+            }
+          } catch(e) {
+            clearTimeout(timeout);
+            // Non-fatal — connectivity test result read failed, but queue/join worked
+            debugLog('[HF] Test result read failed (non-fatal): ' + e.message);
+          }
+          
+          this.status = 'ready';
+          if (this.onStatusChange) this.onStatusChange('ready', 100);
+          if (onProgress) onProgress(100);
+          debugLog('[HF] Ready — server-side Kokoro TTS via HF Space');
+        } catch (err) {
+          debugLog('[HF] ❌ Init failed: ' + err.message);
+          this.status = 'error';
+          if (this.onStatusChange) this.onStatusChange('error', 0);
+          throw err;
+        }
+      }
+      
+      // ============================================================
+      // CORE: Generate audio for a single text chunk via HF Space API
+      // Steps: queue/join → queue/data (SSE) → fetch WAV → decode
+      // ============================================================
+      
+      async _generateSentence(text, voice, speed) {
+        const sessionHash = 'sr_' + Math.random().toString(36).slice(2, 10);
+        const trimmed = text.trim();
+        if (trimmed.length < 2) return null;
+        
+        // Step 1: Join queue
+        debugLog('[HF] → POST queue/join: "' + trimmed.substring(0, 50) + (trimmed.length > 50 ? '...' : '') + '"');
+        
+        let joinRes;
+        try {
+          joinRes = await fetch(this.HF_BASE + '/gradio_api/queue/join', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              data: [trimmed, voice || 'af_heart', speed || 1.0, false],
+              fn_index: 4,
+              session_hash: sessionHash
+            })
+          });
+        } catch(fetchErr) {
+          debugLog('[HF] ❌ queue/join fetch error: ' + fetchErr.message);
+          throw new Error('queue/join network error: ' + fetchErr.message);
+        }
+        
+        debugLog('[HF] ← queue/join: HTTP ' + joinRes.status);
+        if (!joinRes.ok) {
+          const errText = await joinRes.text().catch(() => '(no body)');
+          debugLog('[HF] ❌ queue/join error body: ' + errText.substring(0, 200));
+          throw new Error('Queue join HTTP ' + joinRes.status + ': ' + errText.substring(0, 100));
+        }
+        
+        const joinData = await joinRes.json();
+        debugLog('[HF] ← event_id: ' + (joinData.event_id || 'none'));
+        
+        // Step 2: Read SSE result with timeout
+        debugLog('[HF] → GET queue/data (session: ' + sessionHash + ')');
+        const controller = new AbortController();
+        const timeout = setTimeout(() => {
+          debugLog('[HF] ⏰ queue/data timeout (30s), aborting');
+          controller.abort();
+        }, 30000);
+        
+        let sseText;
+        try {
+          const dataRes = await fetch(
+            this.HF_BASE + '/gradio_api/queue/data?session_hash=' + sessionHash,
+            { signal: controller.signal }
+          );
+          clearTimeout(timeout);
+          debugLog('[HF] ← queue/data: HTTP ' + dataRes.status + ', content-type: ' + (dataRes.headers.get('content-type') || 'none'));
+          
+          if (!dataRes.ok) {
+            const errText = await dataRes.text().catch(() => '(no body)');
+            debugLog('[HF] ❌ queue/data error: ' + errText.substring(0, 200));
+            throw new Error('Queue data HTTP ' + dataRes.status);
+          }
+          
+          sseText = await dataRes.text();
+          debugLog('[HF] ← SSE: ' + sseText.length + ' chars');
+        } catch(e) {
+          clearTimeout(timeout);
+          if (e.name === 'AbortError') {
+            throw new Error('queue/data timed out after 30s');
+          }
+          debugLog('[HF] ❌ queue/data error: ' + e.message);
+          throw e;
+        }
+        
+        // Step 3: Parse SSE for process_completed
+        let audioUrl = null;
+        const lines = sseText.split('\n');
+        let foundMsgs = [];
+        
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          try {
+            const parsed = JSON.parse(line.slice(6));
+            foundMsgs.push(parsed.msg || 'unknown');
+            
+            if (parsed.msg === 'process_completed') {
+              if (parsed.output?.error) {
+                debugLog('[HF] ❌ Space error: ' + parsed.output.error);
+                throw new Error('HF Space processing error: ' + parsed.output.error);
+              }
+              if (parsed.output?.data) {
+                const fileInfo = parsed.output.data[0];
+                debugLog('[HF] output.data[0] type: ' + typeof fileInfo + ', keys: ' + (fileInfo ? Object.keys(fileInfo).join(',') : 'null'));
+                
+                if (fileInfo?.url) {
+                  audioUrl = fileInfo.url;
+                } else if (fileInfo?.path) {
+                  audioUrl = this.HF_BASE + '/gradio_api/file=' + fileInfo.path;
+                } else if (typeof fileInfo === 'string' && fileInfo.includes('/')) {
+                  // Sometimes Gradio returns just a path string
+                  audioUrl = this.HF_BASE + '/gradio_api/file=' + fileInfo;
+                }
+              }
+            }
+          } catch(e) {
+            if (e.message.includes('HF Space')) throw e;
+            // Not valid JSON, skip
+          }
+        }
+        
+        debugLog('[HF] SSE messages found: ' + foundMsgs.join(', '));
+        
+        if (!audioUrl) {
+          debugLog('[HF] ❌ No audio URL. First 500 chars of SSE:\n' + sseText.substring(0, 500));
+          throw new Error('No audio URL found in SSE response (msgs: ' + foundMsgs.join(',') + ')');
+        }
+        
+        debugLog('[HF] Audio URL: ' + audioUrl.substring(0, 100));
+        
+        // Step 4: Fetch the WAV audio file
+        let audioRes;
+        try {
+          audioRes = await fetch(audioUrl);
+        } catch(fetchErr) {
+          debugLog('[HF] ❌ Audio fetch error: ' + fetchErr.message);
+          throw new Error('Audio fetch network error: ' + fetchErr.message);
+        }
+        
+        debugLog('[HF] ← audio: HTTP ' + audioRes.status + ', content-type: ' + (audioRes.headers.get('content-type') || 'none') + ', size: ' + (audioRes.headers.get('content-length') || '?'));
+        
+        if (!audioRes.ok) throw new Error('Audio fetch HTTP ' + audioRes.status);
+        
+        const arrayBuf = await audioRes.arrayBuffer();
+        debugLog('[HF] Audio buffer: ' + arrayBuf.byteLength + ' bytes');
+        
+        if (arrayBuf.byteLength < 100) {
+          debugLog('[HF] ⚠️ Audio buffer suspiciously small');
+          throw new Error('Audio response too small: ' + arrayBuf.byteLength + ' bytes');
+        }
+        
+        // Step 5: Decode to AudioBuffer
+        let audioBuf;
+        try {
+          audioBuf = await this.audioContext.decodeAudioData(arrayBuf.slice(0)); // slice(0) copies — some browsers consume the buffer
+        } catch(decodeErr) {
+          debugLog('[HF] ❌ decodeAudioData failed: ' + decodeErr.message);
+          throw new Error('Audio decode failed: ' + decodeErr.message);
+        }
+        
+        debugLog('[HF] ✓ Decoded: ' + audioBuf.duration.toFixed(1) + 's, ' + audioBuf.sampleRate + 'Hz');
+        return audioBuf;
+      }
+      
+      // ============================================================
+      // SENTENCE-LEVEL PLAYBACK: _generateSentence per chunk + audio queue
+      // Same sentence splitting as KokoroTTSManager for consistency
+      // ============================================================
+      
+      async streamParagraph(text, voice, speed, onFirst, onDone) {
+        this._resetQueue();
+        this._cancelled = false;
+        this._onDone = onDone;
+        this._estDur = (text.split(/\s+/).length / 150) * 60 / (speed || 1);
+        
+        let n = 0, firstSent = false;
+        
+        try {
+          // Same sentence splitting as KokoroTTSManager
+          const sentences = text.match(/[^.!?]*[.!?]+["'"'\u201D\u2019]?\s*/g) || [text];
+          const chunks = [];
+          for (const s of sentences) {
+            if (chunks.length > 0 && s.trim().length < 30) {
+              chunks[chunks.length - 1] += s;
+            } else if (s.trim().length > 0) {
+              chunks.push(s);
+            }
+          }
+          
+          debugLog('[HF] streamParagraph: ' + chunks.length + ' chunks from ' + text.length + ' chars');
+          
+          for (const chunk of chunks) {
+            if (this._cancelled) break;
+            const trimmed = chunk.trim();
+            if (trimmed.length < 2) continue;
+            
+            const buf = await this._generateSentence(trimmed, voice, speed);
+            if (this._cancelled) break;
+            if (!buf) { debugLog('[HF] Empty result, skipping'); continue; }
+            
+            n++;
+            debugLog('[HF] Chunk ' + n + '/' + chunks.length + ': ' + buf.duration.toFixed(1) + 's');
+            this._enq(buf);
+            
+            if (!firstSent) { firstSent = true; if (onFirst) onFirst(); }
+          }
+        } catch(e) {
+          if (!this._cancelled) {
+            debugLog('[HF] ❌ streamParagraph error: ' + e.message);
+            console.error('[HF] Stream error:', e);
+          }
+        }
+        
+        this._allEnqueued = true;
+        debugLog('[HF] Done: ' + n + ' chunks, ' + this._totalDur.toFixed(1) + 's audio');
+        if (!this._playing && this._queue.length === 0 && this._onDone) this._onDone();
+      }
+      
+      // ============================================================
+      // PLAYBACK QUEUE (identical to KokoroTTSManager)
+      // ============================================================
+      
+      _enq(buf) {
+        this._queue.push(buf);
+        this._totalDur += buf.duration;
+        if (!this._playing) this._next();
+      }
+      
+      async _next() {
+        if (this._queue.length === 0) {
+          this._playing = false;
+          if (this._allEnqueued && this._onDone) this._onDone();
+          return;
+        }
+        this._playing = true;
+        const buf = this._queue.shift();
+        if (this.audioContext.state === 'suspended') await this.audioContext.resume();
+        const src = this.audioContext.createBufferSource();
+        src.buffer = buf;
+        src.connect(this.gainNode);
+        src.onended = () => { this.currentSource = null; this._playedDur += buf.duration; this._next(); };
+        src.start();
+        this.currentSource = src;
+        this._chunkStart = this.audioContext.currentTime;
+      }
+      
+      _resetQueue() {
+        this.stop();
+        this._queue = [];
+        this._playing = false;
+        this._allEnqueued = false;
+        this._onDone = null;
+        this._totalDur = 0;
+        this._playedDur = 0;
+        this._chunkStart = 0;
+        this._estDur = 0;
+        this._cancelled = true;
+      }
+      
+      // ============================================================
+      // PRE-GENERATION (same interface as KokoroTTSManager)
+      // ============================================================
+      
+      pregenerate(key, text, voice, speed) {
+        if (this._preCache[key] || this._prePromises[key]) return;
+        this._prePromises[key] = (async () => {
+          try {
+            const buf = await this._generateSentence(text, voice, speed);
+            if (buf) {
+              this._preCache[key] = buf;
+              debugLog('[HF] Pre-gen: ' + key + ' (' + buf.duration.toFixed(1) + 's)');
+            }
+            delete this._prePromises[key];
+          } catch(e) {
+            debugLog('[HF] Pre-gen failed for ' + key + ': ' + e.message);
+            delete this._prePromises[key];
+          }
+        })();
+      }
+      
+      async getPregen(key) {
+        if (this._preCache[key]) return this._preCache[key];
+        if (this._prePromises[key]) { await this._prePromises[key]; return this._preCache[key] || null; }
+        return null;
+      }
+      
+      usePregen(key) { delete this._preCache[key]; delete this._prePromises[key]; }
+      clearPregen() { this._preCache = {}; this._prePromises = {}; }
+      
+      async playBuffer(buf, onEnd) {
+        this._resetQueue();
+        this._totalDur = buf.duration;
+        this._estDur = buf.duration;
+        this._allEnqueued = true;
+        if (this.audioContext.state === 'suspended') await this.audioContext.resume();
+        const src = this.audioContext.createBufferSource();
+        src.buffer = buf;
+        src.connect(this.gainNode);
+        src.onended = () => { this.currentSource = null; if (onEnd) onEnd(); };
+        src.start();
+        this.currentSource = src;
+        this._chunkStart = this.audioContext.currentTime;
+      }
+      
+      stop() { if (this.currentSource) { try { this.currentSource.stop(); } catch(e) {} this.currentSource = null; } }
+      fullStop() { this._cancelled = true; this._resetQueue(); this.clearPregen(); }
+      pause() { if (this.audioContext?.state === 'running') this.audioContext.suspend(); }
+      resume() { if (this.audioContext?.state === 'suspended') this.audioContext.resume(); }
+      
+      get isPlaying() { return (this._playing || !!this.currentSource) && this.audioContext?.state === 'running'; }
+      
+      getProgress() {
+        const tot = this._allEnqueued ? this._totalDur : this._estDur;
+        if (tot <= 0) return 0;
+        let el = 0;
+        if (this.currentSource && this._chunkStart) el = this.audioContext.currentTime - this._chunkStart;
+        return Math.min(1, (this._playedDur + el) / tot);
+      }
+      
+      setVolume(v) { if (this.gainNode) this.gainNode.gain.value = Math.max(0, Math.min(1, v)); }
+      destroy() { this.fullStop(); if (this.audioContext) this.audioContext.close().catch(() => {}); this.status = 'idle'; }
+    }
+    
+    // ============================================================
+    // TTS MANAGER ROUTING
+    // Desktop: local kokoro-js (WebGPU, fast, works great)
+    // Mobile: HF Space API (same Kokoro model, server-side GPU)
+    // ============================================================
+    
+    const hfSpaceManager = new HFSpaceTTSManager();
+    const ttsManager = USE_HF_SPACE ? hfSpaceManager : kokoroManager;
+    
+    debugLog('Active TTS manager: ' + (USE_HF_SPACE ? 'HFSpaceTTSManager' : 'KokoroTTSManager'));
 
 
 
@@ -1766,7 +2248,7 @@
           sleepTimerRef.current = setTimeout(() => {
             setIsPlaying(false);
             setIsListenPlaying(false);
-            kokoroManager.fullStop();
+            ttsManager.fullStop();
             setSleepMinutes(0);
             setSleepEndTime(null);
           }, sleepMinutes * 60000);
@@ -2014,24 +2496,28 @@
         
         async function play() {
           const para = paragraphRanges[listenParagraphIdx];
-          if (!para || cancelled) return;
+          if (!para || cancelled) {
+            debugLog('[PLAY] Skipped: para=' + !!para + ', cancelled=' + cancelled);
+            return;
+          }
           
+          debugLog('[PLAY] Para ' + (listenParagraphIdx + 1) + '/' + paragraphRanges.length + ': "' + para.text.substring(0, 60) + '..."');
           setIsGenerating(true);
           const paraKey = chapterIndex + ':' + listenParagraphIdx;
           
           try {
             // Check for pre-generated buffer first (instant playback)
-            const pregenBuffer = await kokoroManager.getPregen(paraKey);
+            const pregenBuffer = await ttsManager.getPregen(paraKey);
             
             if (pregenBuffer) {
               console.log('[TTS] Playing pre-gen for para ' + (listenParagraphIdx + 1));
               setIsGenerating(false);
-              kokoroManager.usePregen(paraKey);
-              await kokoroManager.playBuffer(pregenBuffer, () => { advanceParagraph(); });
+              ttsManager.usePregen(paraKey);
+              await ttsManager.playBuffer(pregenBuffer, () => { advanceParagraph(); });
             } else {
               // Stream: generates sentence-by-sentence, plays each as it arrives
               console.log('[TTS] Streaming para ' + (listenParagraphIdx + 1) + '/' + paragraphRanges.length);
-              await kokoroManager.streamParagraph(
+              await ttsManager.streamParagraph(
                 para.text, selectedVoice, listenSpeed,
                 () => { if (!cancelled) setIsGenerating(false); }, // onFirstAudio
                 () => { advanceParagraph(); }, // onAllDone
@@ -2043,7 +2529,7 @@
               const futureIdx = listenParagraphIdx + ahead;
               if (futureIdx < paragraphRanges.length && !cancelled) {
                 const futureKey = chapterIndex + ':' + futureIdx;
-                kokoroManager.pregenerate(futureKey, paragraphRanges[futureIdx].text, selectedVoice, listenSpeed);
+                ttsManager.pregenerate(futureKey, paragraphRanges[futureIdx].text, selectedVoice, listenSpeed);
               }
             }
             
@@ -2051,7 +2537,7 @@
             if (book) {
               updateMediaSession(book.title, book.chapters[chapterIndex]?.title, {
                 play: () => setIsListenPlaying(true),
-                pause: () => { setIsListenPlaying(false); kokoroManager.pause(); },
+                pause: () => { setIsListenPlaying(false); ttsManager.pause(); },
                 prev: () => setListenParagraphIdx(p => Math.max(0, p - 1)),
                 next: () => setListenParagraphIdx(p => Math.min(paragraphRanges.length - 1, p + 1)),
               });
@@ -2067,7 +2553,7 @@
         
         return () => {
           cancelled = true;
-          kokoroManager.fullStop();
+          ttsManager.fullStop();
         };
       }, [mode, isListenPlaying, listenParagraphIdx, modelStatus, paragraphRanges, selectedVoice, listenSpeed, book, chapterIndex, triggerChapterSplash]);
       
@@ -2079,7 +2565,7 @@
         }
         
         listenProgressRef.current = setInterval(() => {
-          setListenAudioProgress(kokoroManager.getProgress());
+          setListenAudioProgress(ttsManager.getProgress());
         }, 100);
         
         return () => { if (listenProgressRef.current) clearInterval(listenProgressRef.current); };
@@ -2111,7 +2597,7 @@
         setLoadError(null);
         setIsPlaying(false);
         setIsListenPlaying(false);
-        kokoroManager.fullStop();
+        ttsManager.fullStop();
         
         try {
           const parsed = await parseEPUB(file);
@@ -2132,17 +2618,20 @@
         if (showChapterSplash) return;
         
         if (mode === 'listen') {
+          debugLog('[UI] Play/Pause pressed, isPlaying=' + isListenPlaying + ', modelStatus=' + modelStatus);
           if (isListenPlaying) {
             setIsListenPlaying(false);
-            kokoroManager.pause();
+            ttsManager.pause();
           } else {
             // If model not loaded, start loading
             if (modelStatus !== 'ready') {
+              debugLog('[UI] Model not ready, initiating load...');
               handleInitKokoro();
               return;
             }
+            debugLog('[UI] Resuming playback');
             setIsListenPlaying(true);
-            kokoroManager.resume();
+            ttsManager.resume();
           }
           return;
         }
@@ -2159,7 +2648,7 @@
       const handleReset = () => {
         setIsPlaying(false);
         setIsListenPlaying(false);
-        kokoroManager.fullStop();
+        ttsManager.fullStop();
         setCurrentIndex(0);
         setListenParagraphIdx(0);
         setInDialogue(false);
@@ -2168,25 +2657,29 @@
       const handleInitKokoro = async () => {
         if (modelStatus === 'loading' || modelStatus === 'ready') return;
         
+        debugLog('[INIT] Starting TTS init (backend: ' + (USE_HF_SPACE ? 'HF Space' : 'local kokoro-js') + ')');
         setModelStatus('loading');
         setModelLoadProgress(0);
         
         try {
-          kokoroManager.onStatusChange = (status, progress) => {
+          ttsManager.onStatusChange = (status, progress) => {
+            debugLog('[INIT] Status: ' + status + ', progress: ' + Math.round(progress) + '%');
             setModelStatus(status);
             setModelLoadProgress(progress);
           };
           
-          await kokoroManager.init((progress) => {
+          await ttsManager.init((progress) => {
             setModelLoadProgress(progress);
           });
           
+          debugLog('[INIT] ✓ TTS ready, auto-starting playback');
           setModelStatus('ready');
           // Auto-start playback after model loads
           setIsListenPlaying(true);
         } catch (err) {
+          debugLog('[INIT] ❌ TTS init failed: ' + err.message);
           setModelStatus('error');
-          setLoadError('Failed to load voice model: ' + err.message);
+          setLoadError((USE_HF_SPACE ? 'Voice server connection failed: ' : 'Failed to load voice model: ') + err.message);
         }
       };
 
@@ -2194,7 +2687,7 @@
         // Stop everything first
         setIsPlaying(false);
         setIsListenPlaying(false);
-        kokoroManager.fullStop();
+        ttsManager.fullStop();
         
         if (mode === 'rsvp') {
           // Switching to listen mode
@@ -2235,7 +2728,7 @@
         if (mode === 'listen') {
           setListenParagraphIdx(p => Math.max(0, p - 1));
           setIsListenPlaying(false);
-          kokoroManager.fullStop();
+          ttsManager.fullStop();
           if (hapticEnabled) haptic(10);
           showNavFeedback('back');
           return;
@@ -2256,7 +2749,7 @@
         if (mode === 'listen') {
           setListenParagraphIdx(p => Math.min(paragraphRanges.length - 1, p + 1));
           setIsListenPlaying(false);
-          kokoroManager.fullStop();
+          ttsManager.fullStop();
           if (hapticEnabled) haptic(10);
           showNavFeedback('forward');
           return;
@@ -2276,7 +2769,7 @@
         
         setIsPlaying(false);
         setIsListenPlaying(false);
-        kokoroManager.fullStop();
+        ttsManager.fullStop();
         setChapterIndex(newIndex);
         setCurrentIndex(0);
         setListenParagraphIdx(0);
@@ -2311,7 +2804,7 @@
         setCurrentIndex(0);
         setIsPlaying(false);
         setIsListenPlaying(false);
-        kokoroManager.fullStop();
+        ttsManager.fullStop();
         setInDialogue(false);
         setShowChapterSplash(false);
         setListenParagraphIdx(0);
@@ -2728,12 +3221,12 @@
         if (modelStatus !== 'loading') return null;
         return e('div', { className: 'model-loading-overlay' }, [
           e('div', { key: 'spin', style: { width: '40px', height: '40px', border: '3px solid rgba(255,255,255,0.1)', borderTopColor: '#ef4444', borderRadius: '50%', animation: 'spin 1s linear infinite' } }),
-          e('div', { key: 'title', style: { fontSize: '1.125rem', fontWeight: '600', color: '#fff' } }, 'Connecting to Voice Server'),
+          e('div', { key: 'title', style: { fontSize: '1.125rem', fontWeight: '600', color: '#fff' } }, USE_HF_SPACE ? 'Connecting to Voice Server' : 'Loading Voice Model'),
           e('div', { key: 'sub', style: { fontSize: '0.8125rem', color: 'rgba(255,255,255,0.5)' } },
-            modelLoadProgress > 50 ? 'Connecting to Kokoro TTS...' : 'Loading client...'),
+            modelLoadProgress > 0 ? (Math.round(modelLoadProgress) + '%') : 'Initializing...'),
           e('div', { key: 'bar', className: 'model-progress-bar' },
             e('div', { className: 'model-progress-fill', style: { width: modelLoadProgress + '%' } })),
-          e('div', { key: 'note', style: { fontSize: '0.6875rem', color: 'rgba(255,255,255,0.3)', marginTop: '0.5rem' } }, 'Free server \u2022 First connect may take ~30s'),
+          e('div', { key: 'note', style: { fontSize: '0.6875rem', color: 'rgba(255,255,255,0.3)', marginTop: '0.5rem' } }, USE_HF_SPACE ? 'Server-side Kokoro TTS \u2022 No download needed' : 'One-time download \u2022 Cached for offline use'),
         ]);
       };
 
@@ -2789,7 +3282,7 @@
                   style: { width: '8rem', height: '4px', borderRadius: '2px', backgroundColor: theme.cardBorder, cursor: 'pointer' },
                 }),
               ]),
-              modelStatus === 'ready' && e('div', { key: 'status', style: { fontSize: '0.6875rem', color: theme.muted, marginTop: '0.25rem' } }, '\u2713 Connected to voice server'),
+              modelStatus === 'ready' && e('div', { key: 'status', style: { fontSize: '0.6875rem', color: theme.muted, marginTop: '0.25rem' } }, USE_HF_SPACE ? '\u2713 Connected to voice server' : '\u2713 Voice model loaded'),
             ]),
             
             // Theme
@@ -3150,11 +3643,15 @@
 
     // Register service worker + check for updates
     if ('serviceWorker' in navigator) {
+      debugLog('[SW] Registering service worker...');
       navigator.serviceWorker.register('sw.js').then((reg) => {
+        debugLog('[SW] Registered, scope: ' + reg.scope);
         reg.addEventListener('updatefound', () => {
+          debugLog('[SW] Update found, installing...');
           const newWorker = reg.installing;
           if (newWorker) {
             newWorker.addEventListener('statechange', () => {
+              debugLog('[SW] New worker state: ' + newWorker.state);
               if (newWorker.state === 'activated' && navigator.serviceWorker.controller) {
                 // New version available — show banner (dispatched to React via custom event)
                 window.dispatchEvent(new Event('sw-update'));
@@ -3162,7 +3659,7 @@
             });
           }
         });
-      }).catch(() => {});
+      }).catch((err) => { debugLog('[SW] Registration failed: ' + err.message); });
     }
   </script>
 </body>
