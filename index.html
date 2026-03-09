@@ -1241,49 +1241,93 @@
       // Generate audio for a text chunk via HF Space API
       // Returns AudioBuffer ready for playback
       async _generateChunk(text, voice, speed) {
-        // New session per request to avoid SSE message conflicts
+        // New session per request to avoid event conflicts
         const session = Math.random().toString(36).slice(2, 12);
         
         // Join the Gradio queue
+        console.log('[TTS] Joining queue for: "' + text.substring(0, 40) + '..."');
         const joinRes = await fetch(HF_SPACE + '/gradio_api/queue/join', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            data: [text, voice || 'af_heart', speed || 1.0, false], // false = CPU (reliable for anon)
+            data: [text, voice || 'af_heart', speed || 1.0, false],
             fn_index: 4,
             session_hash: session,
           }),
         });
         
         if (!joinRes.ok) throw new Error('Failed to join TTS queue: ' + joinRes.status);
-        const { event_id } = await joinRes.json();
+        const joinData = await joinRes.json();
+        console.log('[TTS] Queued, event_id: ' + joinData.event_id);
         
-        // Wait for SSE result (audio URL)
+        // Poll for result using fetch (NOT EventSource — more reliable cross-origin on mobile).
+        // The Gradio SSE endpoint returns text/event-stream which we parse manually.
         const audioUrl = await new Promise((resolve, reject) => {
-          const es = new EventSource(HF_SPACE + '/gradio_api/queue/data?session_hash=' + session);
-          const timeout = setTimeout(() => { es.close(); reject(new Error('TTS timeout')); }, 60000);
+          const ctrl = new AbortController();
+          const timeout = setTimeout(() => { ctrl.abort(); reject(new Error('TTS timeout (60s)')); }, 60000);
           
-          es.onmessage = (msg) => {
+          (async () => {
             try {
-              const data = JSON.parse(msg.data);
-              if (data.msg === 'process_completed') {
-                es.close();
-                clearTimeout(timeout);
-                if (data.success && data.output?.data?.[0]?.url) {
-                  resolve(data.output.data[0].url);
-                } else if (data.success && data.output?.data?.[0]?.path) {
-                  resolve(HF_SPACE + '/gradio_api/file=' + data.output.data[0].path);
-                } else {
-                  reject(new Error('TTS failed: ' + JSON.stringify(data.output)));
+              const sseRes = await fetch(
+                HF_SPACE + '/gradio_api/queue/data?session_hash=' + session,
+                { signal: ctrl.signal }
+              );
+              
+              if (!sseRes.ok) throw new Error('SSE fetch failed: ' + sseRes.status);
+              
+              const reader = sseRes.body.getReader();
+              const decoder = new TextDecoder();
+              let buffer = '';
+              
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                
+                buffer += decoder.decode(value, { stream: true });
+                
+                // Parse SSE events from buffer
+                const lines = buffer.split('\n');
+                buffer = lines.pop(); // Keep incomplete line
+                
+                for (const line of lines) {
+                  if (!line.startsWith('data: ')) continue;
+                  try {
+                    const data = JSON.parse(line.slice(6));
+                    console.log('[TTS] SSE msg:', data.msg);
+                    
+                    if (data.msg === 'process_completed' && data.success) {
+                      clearTimeout(timeout);
+                      const audioData = data.output?.data?.[0];
+                      if (audioData?.url) {
+                        resolve(audioData.url);
+                      } else if (audioData?.path) {
+                        resolve(HF_SPACE + '/gradio_api/file=' + audioData.path);
+                      } else {
+                        reject(new Error('No audio URL in response'));
+                      }
+                      reader.cancel();
+                      return;
+                    } else if (data.msg === 'process_completed' && !data.success) {
+                      clearTimeout(timeout);
+                      reject(new Error('TTS generation failed on server'));
+                      reader.cancel();
+                      return;
+                    }
+                    // Ignore estimation, process_starts, log, etc. — keep reading
+                  } catch(e) { /* non-JSON line, skip */ }
                 }
-              } else if (data.msg === 'close_stream') {
-                es.close();
-                clearTimeout(timeout);
               }
-            } catch(e) {}
-          };
-          es.onerror = () => { es.close(); clearTimeout(timeout); reject(new Error('SSE error')); };
+              // Stream ended without process_completed
+              clearTimeout(timeout);
+              reject(new Error('SSE stream ended without result'));
+            } catch(e) {
+              clearTimeout(timeout);
+              if (e.name !== 'AbortError') reject(e);
+            }
+          })();
         });
+        
+        console.log('[TTS] Fetching audio from: ' + audioUrl.substring(0, 80) + '...');
         
         // Fetch the WAV file and decode to AudioBuffer
         const wavRes = await fetch(audioUrl);
@@ -1339,6 +1383,13 @@
         
         this._allEnqueued = true;
         console.log('[TTS] Done: ' + n + ' chunks, ' + this._totalDur.toFixed(1) + 's audio');
+        // IMPORTANT: Only advance to next paragraph if we actually played something.
+        // If n === 0, generation failed — surface the error, don't cascade.
+        if (n === 0) {
+          console.warn('[TTS] No audio generated — NOT advancing paragraph');
+          this._onDone = null;
+          throw new Error('Voice generation failed — check your internet connection and try again');
+        }
         if (!this._playing && this._queue.length === 0 && this._onDone) this._onDone();
       }
       
