@@ -526,12 +526,10 @@
     const IS_MOBILE = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
     const HAS_WEBGPU = !!navigator.gpu;
     
-    // On mobile, WebGPU produces garbled audio (transformers.js bug #1320).
-    // WASM works but is too slow for continuous reading.
-    // So on mobile we route to HF Space API for server-side inference.
-    const USE_HF_SPACE = IS_MOBILE;
+    // On mobile, WebGPU previously produced garbled audio with q8 quantization
+    // (transformers.js bug #1320). Fix: use fp32 + transformers.js v4's new WebGPU runtime.
     
-    debugLog('Platform: ' + (IS_MOBILE ? 'MOBILE' : 'DESKTOP') + ', WebGPU: ' + HAS_WEBGPU + ', TTS backend: ' + (USE_HF_SPACE ? 'HF Space API' : 'Local kokoro-js'));
+    debugLog('Platform: ' + (IS_MOBILE ? 'MOBILE' : 'DESKTOP') + ', WebGPU: ' + HAS_WEBGPU + ', TTS: local kokoro-js (fp32/WebGPU if available)');
     
     // ============================================================
     // CONSTANTS & SPECIAL MARKERS
@@ -1173,7 +1171,7 @@
     // ============================================================
     // KOKORO TTS — MAIN THREAD + STREAM API
     // Uses generate() per sentence with queue-based playback.
-    // q8 + webgpu for fast inference (~150-600ms per sentence).
+    // q8 (WASM) or fp32 (WebGPU) for fast inference (~150-600ms per sentence).
     // Queue-based playback starts after first sentence generates.
     // No Worker needed — WebGPU per-sentence latency is sub-frame.
     // ============================================================
@@ -1215,13 +1213,23 @@
         if (this.onStatusChange) this.onStatusChange('loading', 0);
         
         try {
-          const mod = await import('https://cdn.jsdelivr.net/npm/kokoro-js@1/+esm');
+          // Load kokoro-js with transformers.js v4 (new C++ WebGPU runtime fixes mobile garbled audio)
+          // esm.sh ?deps= override forces v4 even though kokoro-js pins v3
+          debugLog('[TTS] Importing kokoro-js with transformers.js v4...');
+          let mod;
+          try {
+            mod = await import('https://esm.sh/kokoro-js@1.2.1?deps=@huggingface/transformers@next');
+            debugLog('[TTS] ✓ Loaded via esm.sh (transformers.js v4)');
+          } catch(e) {
+            debugLog('[TTS] esm.sh failed (' + e.message + '), falling back to jsdelivr (v3)');
+            mod = await import('https://cdn.jsdelivr.net/npm/kokoro-js@1/+esm');
+          }
           const KokoroTTS = mod.KokoroTTS;
           if (!KokoroTTS) throw new Error('KokoroTTS not found');
           
-          // q8 + webgpu: 86MB model, WebGPU-accelerated inference.
-          // Per TLD2 production guide: q8 on WebGPU is "indistinguishable from fp32
-          // in blind listening tests" with 150-600ms per sentence latency.
+          // Device selection: always try WebGPU first (including mobile).
+          // The old garbled audio bug was caused by q8 quantization on mobile WebGPU
+          // (transformers.js #1320) — using fp32 + v4's new C++ WebGPU runtime fixes it.
           let device = 'wasm';
           try {
             if (navigator.gpu) {
@@ -1230,12 +1238,16 @@
             }
           } catch(e) {}
           
-          console.log('[TTS] Loading: q8/' + device);
+          // dtype: fp32 for WebGPU (recommended by kokoro-js docs, avoids q8 garbling)
+          //        q8 for WASM (smaller download, WASM handles quantized formats fine)
+          const dtype = device === 'webgpu' ? 'fp32' : 'q8';
+          
+          debugLog('[TTS] Loading: ' + dtype + '/' + device + (IS_MOBILE ? ' (mobile)' : ' (desktop)'));
           
           this.tts = await KokoroTTS.from_pretrained(
             'onnx-community/Kokoro-82M-v1.0-ONNX',
             {
-              dtype: 'q8',
+              dtype,
               device,
               progress_callback: (p) => {
                 if (p.status === 'progress' && p.progress != null) {
@@ -1253,7 +1265,7 @@
           
           this.status = 'ready';
           if (this.onStatusChange) this.onStatusChange('ready', 100);
-          console.log('[TTS] Ready (q8/' + device + ')');
+          console.log('[TTS] Ready (' + dtype + '/' + device + ')');
         } catch (err) {
           console.error('[TTS] Init failed:', err);
           this.status = 'error';
@@ -1780,9 +1792,10 @@
     // ============================================================
     
     const hfSpaceManager = new HFSpaceTTSManager();
-    const ttsManager = USE_HF_SPACE ? hfSpaceManager : kokoroManager;
+    // Always use local kokoro-js — WASM on mobile, WebGPU on desktop
+    const ttsManager = kokoroManager;
     
-    debugLog('Active TTS manager: ' + (USE_HF_SPACE ? 'HFSpaceTTSManager' : 'KokoroTTSManager'));
+    debugLog('Active TTS manager: KokoroTTSManager');
 
 
 
@@ -1922,6 +1935,7 @@
       const [modelLoadProgress, setModelLoadProgress] = useState(0);
       const [listenAudioProgress, setListenAudioProgress] = useState(0);
       const [isGenerating, setIsGenerating] = useState(false);
+      
       
       // Sleep timer
       const [sleepMinutes, setSleepMinutes] = useState(0); // 0 = off
@@ -2365,7 +2379,7 @@
       // ============================================================
       
       // Start/stop listen mode audio
-      // Architecture: stream() for current para + pre-gen next 2 via stream()
+      // Real-time sentence streaming with pre-gen on all platforms
       useEffect(() => {
         if (mode !== 'listen' || !isListenPlaying) return;
         if (modelStatus !== 'ready') return;
@@ -2426,15 +2440,11 @@
             }
             
             // Pre-generate next 2 paragraphs while current plays
-            // Disabled for HF Space: CPU server can only handle one request at a time,
-            // concurrent pre-gen causes queue contention and 60s+ timeouts
-            if (!USE_HF_SPACE) {
-              for (let ahead = 1; ahead <= 2; ahead++) {
-                const futureIdx = listenParagraphIdx + ahead;
-                if (futureIdx < paragraphRanges.length && !cancelled) {
-                  const futureKey = chapterIndex + ':' + futureIdx;
-                  ttsManager.pregenerate(futureKey, paragraphRanges[futureIdx].text, selectedVoice, listenSpeed);
-                }
+            for (let ahead = 1; ahead <= 2; ahead++) {
+              const futureIdx = listenParagraphIdx + ahead;
+              if (futureIdx < paragraphRanges.length && !cancelled) {
+                const futureKey = chapterIndex + ':' + futureIdx;
+                ttsManager.pregenerate(futureKey, paragraphRanges[futureIdx].text, selectedVoice, listenSpeed);
               }
             }
             
@@ -2562,7 +2572,7 @@
       const handleInitKokoro = async () => {
         if (modelStatus === 'loading' || modelStatus === 'ready') return;
         
-        debugLog('[INIT] Starting TTS init (backend: ' + (USE_HF_SPACE ? 'HF Space' : 'local kokoro-js') + ')');
+        debugLog('[INIT] Starting TTS init (backend: ' + ('local kokoro-js') + ')');
         setModelStatus('loading');
         setModelLoadProgress(0);
         
@@ -2577,14 +2587,14 @@
             setModelLoadProgress(progress);
           });
           
-          debugLog('[INIT] ✓ TTS ready, auto-starting playback');
+          debugLog('[INIT] ✓ TTS ready');
           setModelStatus('ready');
           // Auto-start playback after model loads
           setIsListenPlaying(true);
         } catch (err) {
           debugLog('[INIT] ❌ TTS init failed: ' + err.message);
           setModelStatus('error');
-          setLoadError((USE_HF_SPACE ? 'Voice server connection failed: ' : 'Failed to load voice model: ') + err.message);
+          setLoadError(('Failed to load voice model: ') + err.message);
         }
       };
 
@@ -3126,14 +3136,15 @@
         if (modelStatus !== 'loading') return null;
         return e('div', { className: 'model-loading-overlay' }, [
           e('div', { key: 'spin', style: { width: '40px', height: '40px', border: '3px solid rgba(255,255,255,0.1)', borderTopColor: '#ef4444', borderRadius: '50%', animation: 'spin 1s linear infinite' } }),
-          e('div', { key: 'title', style: { fontSize: '1.125rem', fontWeight: '600', color: '#fff' } }, USE_HF_SPACE ? 'Connecting to Voice Server' : 'Loading Voice Model'),
+          e('div', { key: 'title', style: { fontSize: '1.125rem', fontWeight: '600', color: '#fff' } }, 'Loading Voice Model'),
           e('div', { key: 'sub', style: { fontSize: '0.8125rem', color: 'rgba(255,255,255,0.5)' } },
             modelLoadProgress > 0 ? (Math.round(modelLoadProgress) + '%') : 'Initializing...'),
           e('div', { key: 'bar', className: 'model-progress-bar' },
             e('div', { className: 'model-progress-fill', style: { width: modelLoadProgress + '%' } })),
-          e('div', { key: 'note', style: { fontSize: '0.6875rem', color: 'rgba(255,255,255,0.3)', marginTop: '0.5rem' } }, USE_HF_SPACE ? 'Server-side Kokoro TTS \u2022 No download needed' : 'One-time download \u2022 Cached for offline use'),
+          e('div', { key: 'note', style: { fontSize: '0.6875rem', color: 'rgba(255,255,255,0.3)', marginTop: '0.5rem' } }, 'One-time download \u2022 Cached for offline use'),
         ]);
       };
+
 
       // ============================================================
       // RENDER: Settings panel
@@ -3187,7 +3198,7 @@
                   style: { width: '8rem', height: '4px', borderRadius: '2px', backgroundColor: theme.cardBorder, cursor: 'pointer' },
                 }),
               ]),
-              modelStatus === 'ready' && e('div', { key: 'status', style: { fontSize: '0.6875rem', color: theme.muted, marginTop: '0.25rem' } }, USE_HF_SPACE ? '\u2713 Connected to voice server' : '\u2713 Voice model loaded'),
+              modelStatus === 'ready' && e('div', { key: 'status', style: { fontSize: '0.6875rem', color: theme.muted, marginTop: '0.25rem' } }, '\u2713 Voice model loaded'),
             ]),
             
             // Theme

@@ -1,4 +1,4 @@
-const CACHE_NAME = 'speedreader-v17';
+const CACHE_NAME = 'speedreader-v18';
 const ASSETS = [
   './',
   './index.html',
@@ -16,6 +16,8 @@ const PASSTHROUGH_DOMAINS = [
   'huggingface.co',
   'gradio.live',
   'workers.dev',
+  'esm.sh',
+  'cdn.jsdelivr.net',
 ];
 
 self.addEventListener('install', (event) => {
