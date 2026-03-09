@@ -1144,14 +1144,41 @@
             const stream = tts.stream(payload.text, { voice: payload.voice, speed: payload.speed });
             let idx = 0;
             for await (const chunk of stream) {
-              const raw = chunk.audio instanceof Float32Array ? chunk.audio
-                : chunk.audio?.data ? new Float32Array(chunk.audio.data)
-                : new Float32Array(0);
-              // Send audio samples as plain array (structured clone, not transfer)
+              // stream() yields { text, phonemes, audio } where audio may be:
+              // - Float32Array directly
+              // - RawAudio { audio: Float32Array, sampling_rate: N }
+              // - Tensor-like { data: Float32Array }
+              // - Nested: chunk.audio.audio for double-wrapped RawAudio
+              let audioSrc = chunk.audio;
+              let sr = 24000;
+              
+              // Unwrap RawAudio: if audioSrc has .audio, go deeper
+              if (audioSrc && audioSrc.audio !== undefined) {
+                sr = audioSrc.sampling_rate || audioSrc.sampleRate || 24000;
+                audioSrc = audioSrc.audio;
+              }
+              
+              // Extract Float32Array
+              let raw;
+              if (audioSrc instanceof Float32Array) raw = audioSrc;
+              else if (audioSrc && audioSrc.data) raw = new Float32Array(audioSrc.data);
+              else if (Array.isArray(audioSrc)) raw = new Float32Array(audioSrc);
+              else if (typeof audioSrc?.toFloat32Array === 'function') raw = audioSrc.toFloat32Array();
+              else raw = new Float32Array(0);
+              
+              // Also check chunk-level sampling_rate
+              if (chunk.sampling_rate) sr = chunk.sampling_rate;
+              
+              if (raw.length === 0) {
+                console.warn('[Worker] Empty audio chunk, skipping. Keys:', Object.keys(chunk));
+                continue;
+              }
+              
+              // Transfer samples to main thread
               self.postMessage({
                 type: 'chunk', id, idx,
                 samples: Array.from(raw),
-                sampleRate: chunk.sampling_rate || 24000,
+                sampleRate: sr,
                 text: (chunk.text || '').substring(0, 50),
               });
               idx++;
