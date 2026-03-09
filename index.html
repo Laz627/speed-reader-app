@@ -1116,10 +1116,9 @@
         this._playStartTime = 0;
         this._playDuration = 0;
         
-        // Pre-generation cache: stores the next paragraph's audio
-        this._pregenBuffer = null;
-        this._pregenKey = null; // string key to identify what was pre-generated
-        this._pregenPromise = null; // in-flight pre-generation promise
+        // Pre-generation cache: stores upcoming paragraphs' audio
+        this._pregenCache = {}; // key → AudioBuffer
+        this._pregenPromises = {}; // key → Promise (in-flight generations)
       }
       
       async init(onProgress) {
@@ -1230,46 +1229,48 @@
       }
       
       /**
-       * Pre-generate the next paragraph in the background.
-       * Stores result so playParagraph can use it instantly.
+       * Pre-generate a paragraph and cache the result.
+       * Can be called multiple times for different keys — all run in parallel.
        */
       pregenerate(key, text, narratorVoice, dialogueVoice, speed, dialogueSplit) {
-        // Don't pre-gen if already cached for this key
-        if (this._pregenKey === key && this._pregenBuffer) return;
+        // Already cached or in-flight? Skip.
+        if (this._pregenCache[key] || this._pregenPromises[key]) return;
         
-        this._pregenKey = key;
-        this._pregenBuffer = null;
-        this._pregenPromise = this.generateParagraph(text, narratorVoice, dialogueVoice, speed, dialogueSplit)
+        this._pregenPromises[key] = this.generateParagraph(text, narratorVoice, dialogueVoice, speed, dialogueSplit)
           .then(buf => {
-            this._pregenBuffer = buf;
-            this._pregenPromise = null;
+            this._pregenCache[key] = buf;
+            delete this._pregenPromises[key];
             console.log('[TTS] Pre-generated: ' + key);
           })
           .catch(err => {
-            this._pregenPromise = null;
-            console.warn('[TTS] Pre-gen failed:', err.message);
+            delete this._pregenPromises[key];
+            console.warn('[TTS] Pre-gen failed for ' + key + ':', err.message);
           });
       }
       
       /**
-       * Get pre-generated buffer if available for the given key.
-       * If pre-generation is in-flight, awaits it.
-       * Returns null if nothing was pre-generated for this key.
+       * Get pre-generated buffer if available. Awaits in-flight generation.
        */
       async getPregenerated(key) {
-        if (this._pregenKey !== key) return null;
-        if (this._pregenBuffer) return this._pregenBuffer;
-        if (this._pregenPromise) {
-          await this._pregenPromise;
-          return this._pregenBuffer;
+        if (this._pregenCache[key]) return this._pregenCache[key];
+        if (this._pregenPromises[key]) {
+          await this._pregenPromises[key];
+          return this._pregenCache[key] || null;
         }
         return null;
       }
       
+      /**
+       * Remove a used key from cache (free memory after playback).
+       */
+      consumePregen(key) {
+        delete this._pregenCache[key];
+        delete this._pregenPromises[key];
+      }
+      
       clearPregen() {
-        this._pregenBuffer = null;
-        this._pregenKey = null;
-        this._pregenPromise = null;
+        this._pregenCache = {};
+        this._pregenPromises = {};
       }
       
       /**
@@ -1974,6 +1975,8 @@
             // Start playing
             await kokoroManager.play(buffer, () => {
               if (cancelled) return;
+              // Free the buffer we just played
+              kokoroManager.consumePregen(paraKey);
               // Auto-advance to next paragraph
               setListenParagraphIdx(prev => {
                 const next = prev + 1;
@@ -1994,14 +1997,18 @@
               });
             });
             
-            // Pre-generate NEXT paragraph while current one plays
-            const nextIdx = listenParagraphIdx + 1;
-            if (nextIdx < paragraphRanges.length && !cancelled) {
-              const nextPara = paragraphRanges[nextIdx];
-              const nextKey = chapterIndex + ':' + nextIdx;
-              kokoroManager.pregenerate(
-                nextKey, nextPara.text, selectedVoice, dialogueVoice, listenSpeed, dialogueSplitEnabled
-              );
+            // Pre-generate NEXT TWO paragraphs while current one plays.
+            // This ensures that even if the next paragraph is short (finishes before
+            // the one after it generates), we still have a buffer ready.
+            for (let ahead = 1; ahead <= 2; ahead++) {
+              const futureIdx = listenParagraphIdx + ahead;
+              if (futureIdx < paragraphRanges.length && !cancelled) {
+                const futurePara = paragraphRanges[futureIdx];
+                const futureKey = chapterIndex + ':' + futureIdx;
+                kokoroManager.pregenerate(
+                  futureKey, futurePara.text, selectedVoice, dialogueVoice, listenSpeed, dialogueSplitEnabled
+                );
+              }
             }
             
             // Update media session
