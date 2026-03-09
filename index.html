@@ -2452,7 +2452,11 @@
             if (pregenBuffer) {
               debugLog('[TTS] ✓ Playing from pre-gen cache: para ' + (listenParagraphIdx + 1));
               setIsGenerating(false);
+              setListenAudioProgress(0);
               ttsManager.usePregen(paraKey);
+              // Yield to let React flush the progress reset before audio starts
+              await new Promise(r => setTimeout(r, 50));
+              if (cancelled) return;
               await ttsManager.playBuffer(pregenBuffer, () => { advanceParagraph(); });
             } else {
               // Stream: generates sentence-by-sentence, plays each as it arrives
@@ -2464,17 +2468,30 @@
               );
             }
             
-            // Pre-generate next paragraph(s) while current plays.
-            // Mobile (paragraph chunking): GPU is idle during playback, so
-            // pre-gen of next paragraph runs uncontested. 1 ahead is enough.
-            // Desktop (sentence streaming): 2 ahead for seamless transitions.
-            const lookAhead = IS_MOBILE ? 1 : 2;
-            for (let ahead = 1; ahead <= lookAhead; ahead++) {
-              const futureIdx = listenParagraphIdx + ahead;
-              if (futureIdx < paragraphRanges.length && !cancelled) {
-                const futureKey = chapterIndex + ':' + futureIdx;
-                ttsManager.pregenerate(futureKey, paragraphRanges[futureIdx].text, selectedVoice, listenSpeed);
-              }
+            // Rolling pre-generation: keep the GPU busy during playback.
+            // Each paragraph pre-gen chains to the next so the cache fills
+            // as deep as possible. A short 5s paragraph won't bottleneck
+            // if the GPU already pre-gen'd several paragraphs ahead.
+            if (!cancelled) {
+              (async () => {
+                const maxAhead = IS_MOBILE ? 10 : 3; // mobile: fill deep, desktop: 3 is plenty
+                for (let ahead = 1; ahead <= maxAhead; ahead++) {
+                  if (cancelled) break;
+                  const futureIdx = listenParagraphIdx + ahead;
+                  if (futureIdx >= paragraphRanges.length) break;
+                  
+                  const futureKey = chapterIndex + ':' + futureIdx;
+                  // Skip if already cached or in progress
+                  if (ttsManager._preCache[futureKey] || ttsManager._prePromises[futureKey]) continue;
+                  
+                  // Generate and wait for it to finish before starting next
+                  ttsManager.pregenerate(futureKey, paragraphRanges[futureIdx].text, selectedVoice, listenSpeed);
+                  // Wait for this one to complete before starting next (sequential, not parallel)
+                  if (ttsManager._prePromises[futureKey]) {
+                    await ttsManager._prePromises[futureKey];
+                  }
+                }
+              })();
             }
             
             // Media session
