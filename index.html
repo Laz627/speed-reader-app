@@ -2450,7 +2450,7 @@
             const pregenBuffer = await ttsManager.getPregen(paraKey);
             
             if (pregenBuffer) {
-              console.log('[TTS] Playing pre-gen for para ' + (listenParagraphIdx + 1));
+              debugLog('[TTS] ✓ Playing from pre-gen cache: para ' + (listenParagraphIdx + 1));
               setIsGenerating(false);
               ttsManager.usePregen(paraKey);
               await ttsManager.playBuffer(pregenBuffer, () => { advanceParagraph(); });
@@ -2497,7 +2497,19 @@
         
         return () => {
           cancelled = true;
-          ttsManager.fullStop();
+          // Stop current playback but PRESERVE pre-gen cache.
+          // fullStop() calls clearPregen() which wipes the cache before
+          // the next play() can read from it. Instead, just stop audio.
+          ttsManager._cancelled = true;
+          ttsManager.stop();
+          ttsManager._queue = [];
+          ttsManager._playing = false;
+          ttsManager._allEnqueued = false;
+          ttsManager._onDone = null;
+          ttsManager._totalDur = 0;
+          ttsManager._playedDur = 0;
+          ttsManager._chunkStart = 0;
+          ttsManager._estDur = 0;
         };
       }, [mode, isListenPlaying, listenParagraphIdx, modelStatus, paragraphRanges, selectedVoice, listenSpeed, book, chapterIndex, triggerChapterSplash]);
       
