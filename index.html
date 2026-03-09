@@ -1105,217 +1105,266 @@
      * Splits at sentence boundaries to keep natural speech flow.
      * Short text passes through unchanged.
      */
+    // ============================================================
+    // KOKORO TTS — WEB WORKER ARCHITECTURE
+    // Inference runs off the main thread. Main thread only plays audio.
+    // This is why the demo site is smooth — same approach.
+    // ============================================================
+    
+    const WORKER_CODE = `
+      let tts = null;
+      
+      self.onmessage = async (e) => {
+        const { type, id, payload } = e.data;
+        
+        if (type === 'init') {
+          try {
+            const mod = await import('https://cdn.jsdelivr.net/npm/kokoro-js@1/+esm');
+            tts = await mod.KokoroTTS.from_pretrained(
+              'onnx-community/Kokoro-82M-v1.0-ONNX',
+              {
+                dtype: payload.dtype,
+                device: payload.device,
+                progress_callback: (p) => {
+                  if (p.status === 'progress' && p.progress != null) {
+                    self.postMessage({ type: 'progress', value: p.progress });
+                  }
+                },
+              }
+            );
+            self.postMessage({ type: 'ready' });
+          } catch(err) {
+            self.postMessage({ type: 'error', error: err.message });
+          }
+        }
+        
+        if (type === 'stream') {
+          if (!tts) { self.postMessage({ type: 'stream-error', id, error: 'Not loaded' }); return; }
+          try {
+            const stream = tts.stream(payload.text, { voice: payload.voice, speed: payload.speed });
+            let idx = 0;
+            for await (const chunk of stream) {
+              const raw = chunk.audio instanceof Float32Array ? chunk.audio
+                : chunk.audio?.data ? new Float32Array(chunk.audio.data)
+                : new Float32Array(0);
+              // Send audio samples as plain array (structured clone, not transfer)
+              self.postMessage({
+                type: 'chunk', id, idx,
+                samples: Array.from(raw),
+                sampleRate: chunk.sampling_rate || 24000,
+                text: (chunk.text || '').substring(0, 50),
+              });
+              idx++;
+            }
+            self.postMessage({ type: 'stream-end', id, total: idx });
+          } catch(err) {
+            self.postMessage({ type: 'stream-error', id, error: err.message });
+          }
+        }
+      };
+    `;
+    
     class KokoroTTSManager {
       constructor() {
-        this.tts = null;
+        this.worker = null;
         this.audioContext = null;
         this.currentSource = null;
+        this.gainNode = null;
         this.status = 'idle';
         this.loadProgress = 0;
         this.onStatusChange = null;
         this.onProgressChange = null;
-        this.gainNode = null;
         
-        // Queue-based playback: chunks enqueue as stream() yields them
+        // Playback queue
         this._queue = [];
-        this._isQueuePlaying = false;
-        this._onQueueDone = null;
-        this._allChunksEnqueued = false;
+        this._isPlaying = false;
+        this._onAllDone = null;
+        this._streamDone = false;
         this._totalDuration = 0;
         this._playedDuration = 0;
-        this._currentChunkStart = 0;
-        this._estimatedDuration = 0;
+        this._chunkStart = 0;
+        this._estDuration = 0;
         
-        // Pre-generation
+        // Pre-gen
         this._pregenCache = {};
         this._pregenPromises = {};
-        
-        // Cancel token for current stream
-        this._cancelStream = false;
+        this._streamId = 0;
       }
       
       async init(onProgress) {
         if (this.status === 'ready') return;
         if (this.status === 'loading') return;
-        
         this.status = 'loading';
         this.onProgressChange = onProgress;
         if (this.onStatusChange) this.onStatusChange('loading', 0);
         
-        try {
-          const kokoroModule = await import('https://cdn.jsdelivr.net/npm/kokoro-js@1/+esm');
-          const KokoroTTS = kokoroModule.KokoroTTS;
-          if (!KokoroTTS) throw new Error('KokoroTTS not found');
+        // Detect device
+        const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)
+          || (navigator.maxTouchPoints > 0 && window.innerWidth < 1024);
+        let device = 'wasm', dtype = 'q8';
+        if (!isMobile) {
+          try { if (navigator.gpu && await navigator.gpu.requestAdapter()) { device = 'webgpu'; dtype = 'fp32'; } } catch(e) {}
+        }
+        console.log('[TTS] Worker init: ' + device + '/' + dtype + (isMobile ? ' (mobile)' : ''));
+        
+        return new Promise((resolve, reject) => {
+          const blob = new Blob([WORKER_CODE], { type: 'application/javascript' });
+          const url = URL.createObjectURL(blob);
+          this.worker = new Worker(url, { type: 'module' });
+          URL.revokeObjectURL(url);
           
-          // Mobile: WASM/q8 (stable, smaller, no GPU pressure)
-          // Desktop: WebGPU/fp32 (fast, dedicated VRAM)
-          const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)
-            || (navigator.maxTouchPoints > 0 && window.innerWidth < 1024);
-          
-          let device = 'wasm';
-          let dtype = 'q8';
-          
-          if (!isMobile) {
-            try {
-              if (navigator.gpu) {
-                const adapter = await navigator.gpu.requestAdapter();
-                if (adapter) { device = 'webgpu'; dtype = 'fp32'; }
-              }
-            } catch(e) {}
-          }
-          
-          console.log('[TTS] Loading: ' + device + '/' + dtype + (isMobile ? ' (mobile)' : ' (desktop)'));
-          
-          this.tts = await KokoroTTS.from_pretrained(
-            'onnx-community/Kokoro-82M-v1.0-ONNX',
-            {
-              dtype, device,
-              progress_callback: (p) => {
-                if (p.status === 'progress' && p.progress != null) {
-                  this.loadProgress = p.progress;
-                  if (this.onStatusChange) this.onStatusChange('loading', p.progress);
-                  if (this.onProgressChange) this.onProgressChange(p.progress);
-                }
-              },
+          this.worker.onmessage = (e) => {
+            const m = e.data;
+            if (m.type === 'progress') {
+              this.loadProgress = m.value;
+              if (this.onStatusChange) this.onStatusChange('loading', m.value);
+              if (this.onProgressChange) this.onProgressChange(m.value);
             }
-          );
-          
-          this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
-          this.gainNode = this.audioContext.createGain();
-          this.gainNode.connect(this.audioContext.destination);
-          
-          this.status = 'ready';
-          if (this.onStatusChange) this.onStatusChange('ready', 100);
-          console.log('[TTS] Ready (' + device + '/' + dtype + ')');
-        } catch (err) {
-          console.error('[TTS] Init failed:', err);
-          this.status = 'error';
-          if (this.onStatusChange) this.onStatusChange('error', 0);
-          throw err;
-        }
-      }
-      
-      _audioToBuffer(audioResult) {
-        const audioData = audioResult.audio || audioResult;
-        const sampleRate = audioResult.sampling_rate || 24000;
-        let float32;
-        if (audioData instanceof Float32Array) float32 = audioData;
-        else if (audioData.data) float32 = new Float32Array(audioData.data);
-        else if (ArrayBuffer.isView(audioData)) float32 = new Float32Array(audioData.buffer);
-        else throw new Error('Unexpected audio format');
-        const buffer = this.audioContext.createBuffer(1, float32.length, sampleRate);
-        buffer.copyToChannel(float32, 0);
-        return buffer;
-      }
-      
-      // ============================================================
-      // STREAMING PLAYBACK using tts.stream()
-      // The official API for long text — handles sentence splitting
-      // internally, yields audio chunks as generated.
-      // ============================================================
-      
-      async streamAndPlay(text, voice, speed, onFirstAudio, onAllDone) {
-        this._resetQueue();
-        this._cancelStream = false;
-        this._onQueueDone = onAllDone;
-        
-        const wordCount = text.split(/\s+/).length;
-        this._estimatedDuration = (wordCount / 150) * 60 / (speed || 1.0);
-        
-        let chunkCount = 0;
-        let firstAudioSent = false;
-        
-        try {
-          const stream = this.tts.stream(text, { voice: voice || 'af_heart', speed: speed || 1.0 });
-          
-          for await (const chunk of stream) {
-            if (this._cancelStream) break;
-            
-            const buffer = this._audioToBuffer(chunk);
-            chunkCount++;
-            console.log('[TTS] Chunk ' + chunkCount + ': ' + buffer.duration.toFixed(1) + 's | "' + (chunk.text || '').substring(0, 40) + '..."');
-            
-            this._enqueue(buffer);
-            
-            if (!firstAudioSent) {
-              firstAudioSent = true;
-              if (onFirstAudio) onFirstAudio();
+            if (m.type === 'ready') {
+              this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+              this.gainNode = this.audioContext.createGain();
+              this.gainNode.connect(this.audioContext.destination);
+              this.status = 'ready';
+              if (this.onStatusChange) this.onStatusChange('ready', 100);
+              console.log('[TTS] Worker ready');
+              // Switch to streaming message handler
+              this.worker.onmessage = (ev) => this._onWorkerMsg(ev.data);
+              resolve();
             }
-            
-            // Micro-yield: let browser process audio + React renders
-            await new Promise(r => setTimeout(r, 0));
-          }
-        } catch(err) {
-          if (!this._cancelStream) console.error('[TTS] Stream error:', err);
-        }
-        
-        this._allChunksEnqueued = true;
-        console.log('[TTS] All ' + chunkCount + ' chunks enqueued');
-        
-        if (!this._isQueuePlaying && this._queue.length === 0 && this._onQueueDone) {
-          this._onQueueDone();
-        }
+            if (m.type === 'error') {
+              this.status = 'error';
+              if (this.onStatusChange) this.onStatusChange('error', 0);
+              reject(new Error(m.error));
+            }
+          };
+          
+          this.worker.postMessage({ type: 'init', payload: { dtype, device } });
+        });
       }
       
-      _enqueue(buffer) {
-        this._queue.push(buffer);
-        this._totalDuration += buffer.duration;
-        if (!this._isQueuePlaying) this._playNext();
+      // Handle all worker messages — routes by stream ID
+      _onWorkerMsg(m) {
+        // Check for pre-gen callbacks first
+        const pgCb = this._pregenCallbacks && this._pregenCallbacks[m.id];
+        if (pgCb) {
+          if (m.type === 'chunk') pgCb.chunks.push(m);
+          else if (m.type === 'stream-end') {
+            pgCb.resolve();
+            delete this._pregenCallbacks[m.id];
+          }
+          else if (m.type === 'stream-error') {
+            pgCb.resolve();
+            delete this._pregenCallbacks[m.id];
+          }
+          return;
+        }
+        
+        // Main stream messages
+        if (m.type === 'chunk') {
+          const float32 = new Float32Array(m.samples);
+          const buffer = this.audioContext.createBuffer(1, float32.length, m.sampleRate);
+          buffer.copyToChannel(float32, 0);
+          console.log('[TTS] Chunk ' + (m.idx + 1) + ': ' + buffer.duration.toFixed(1) + 's | "' + m.text + '..."');
+          this._totalDuration += buffer.duration;
+          this._queue.push(buffer);
+          if (!this._isPlaying) this._playNext();
+          if (this._onFirstAudio) { this._onFirstAudio(); this._onFirstAudio = null; }
+        }
+        if (m.type === 'stream-end') {
+          this._streamDone = true;
+          console.log('[TTS] Worker done: ' + m.total + ' chunks');
+          if (!this._isPlaying && this._queue.length === 0 && this._onAllDone) this._onAllDone();
+        }
+        if (m.type === 'stream-error') {
+          console.error('[TTS] Worker error:', m.error);
+          this._streamDone = true;
+          if (this._onStreamError) this._onStreamError(m.error);
+        }
       }
       
       async _playNext() {
         if (this._queue.length === 0) {
-          this._isQueuePlaying = false;
-          if (this._allChunksEnqueued && this._onQueueDone) this._onQueueDone();
+          this._isPlaying = false;
+          if (this._streamDone && this._onAllDone) this._onAllDone();
           return;
         }
-        this._isQueuePlaying = true;
-        const buffer = this._queue.shift();
+        this._isPlaying = true;
+        const buf = this._queue.shift();
         if (this.audioContext.state === 'suspended') await this.audioContext.resume();
-        const source = this.audioContext.createBufferSource();
-        source.buffer = buffer;
-        source.connect(this.gainNode);
-        source.onended = () => { this.currentSource = null; this._playedDuration += buffer.duration; this._playNext(); };
-        source.start();
-        this.currentSource = source;
-        this._currentChunkStart = this.audioContext.currentTime;
+        const src = this.audioContext.createBufferSource();
+        src.buffer = buf;
+        src.connect(this.gainNode);
+        src.onended = () => { this.currentSource = null; this._playedDuration += buf.duration; this._playNext(); };
+        src.start();
+        this.currentSource = src;
+        this._chunkStart = this.audioContext.currentTime;
       }
       
       _resetQueue() {
         this.stop();
         this._queue = [];
-        this._isQueuePlaying = false;
-        this._allChunksEnqueued = false;
-        this._onQueueDone = null;
+        this._isPlaying = false;
+        this._streamDone = false;
+        this._onAllDone = null;
+        this._onFirstAudio = null;
+        this._onStreamError = null;
         this._totalDuration = 0;
         this._playedDuration = 0;
-        this._currentChunkStart = 0;
-        this._estimatedDuration = 0;
-        this._cancelStream = true;
+        this._chunkStart = 0;
+        this._estDuration = 0;
       }
       
       // ============================================================
-      // PRE-GENERATION using stream() for next paragraphs
+      // PUBLIC API
       // ============================================================
       
-      async pregenerate(key, text, voice, speed) {
+      streamAndPlay(text, voice, speed, onFirstAudio, onAllDone) {
+        this._resetQueue();
+        this._onAllDone = onAllDone;
+        this._onFirstAudio = onFirstAudio;
+        this._estDuration = (text.split(/\s+/).length / 150) * 60 / (speed || 1.0);
+        this._streamId++;
+        this.worker.postMessage({
+          type: 'stream', id: this._streamId,
+          payload: { text, voice: voice || 'af_heart', speed: speed || 1.0 },
+        });
+      }
+      
+      // Pre-gen: stream in worker, collect chunks via callback map
+      pregenerate(key, text, voice, speed) {
         if (this._pregenCache[key] || this._pregenPromises[key]) return;
-        this._pregenPromises[key] = (async () => {
-          try {
-            const buffers = [];
-            const stream = this.tts.stream(text, { voice: voice || 'af_heart', speed: speed || 1.0 });
-            for await (const chunk of stream) { buffers.push(this._audioToBuffer(chunk)); }
-            if (buffers.length === 0) return;
-            const totalLen = buffers.reduce((s, b) => s + b.length, 0);
-            const result = this.audioContext.createBuffer(1, totalLen, buffers[0].sampleRate);
-            const ch = result.getChannelData(0);
-            let off = 0;
-            for (const b of buffers) { ch.set(b.getChannelData(0), off); off += b.length; }
-            this._pregenCache[key] = result;
+        if (!this._pregenCallbacks) this._pregenCallbacks = {};
+        
+        const id = ++this._streamId;
+        const entry = { chunks: [], resolve: null };
+        
+        this._pregenPromises[key] = new Promise((resolve) => {
+          entry.resolve = () => {
+            // Concat chunks into single buffer
+            const bufs = entry.chunks.map(c => {
+              const f32 = new Float32Array(c.samples);
+              const buf = this.audioContext.createBuffer(1, f32.length, c.sampleRate);
+              buf.copyToChannel(f32, 0);
+              return buf;
+            });
+            if (bufs.length > 0) {
+              const totalLen = bufs.reduce((s, b) => s + b.length, 0);
+              const result = this.audioContext.createBuffer(1, totalLen, bufs[0].sampleRate);
+              const ch = result.getChannelData(0);
+              let off = 0;
+              for (const b of bufs) { ch.set(b.getChannelData(0), off); off += b.length; }
+              this._pregenCache[key] = result;
+              console.log('[TTS] Pre-gen: ' + key + ' (' + result.duration.toFixed(1) + 's)');
+            }
             delete this._pregenPromises[key];
-            console.log('[TTS] Pre-gen ready: ' + key + ' (' + result.duration.toFixed(1) + 's)');
-          } catch(e) { delete this._pregenPromises[key]; }
-        })();
+            resolve();
+          };
+          this._pregenCallbacks[id] = entry;
+          this.worker.postMessage({
+            type: 'stream', id,
+            payload: { text, voice: voice || 'af_heart', speed: speed || 1.0 },
+          });
+        });
       }
       
       async getPregenerated(key) {
@@ -1323,46 +1372,45 @@
         if (this._pregenPromises[key]) { await this._pregenPromises[key]; return this._pregenCache[key] || null; }
         return null;
       }
-      
       consumePregen(key) { delete this._pregenCache[key]; delete this._pregenPromises[key]; }
       clearPregen() { this._pregenCache = {}; this._pregenPromises = {}; }
       
       async playBuffer(buffer, onEnded) {
         this._resetQueue();
         this._totalDuration = buffer.duration;
-        this._estimatedDuration = buffer.duration;
+        this._estDuration = buffer.duration;
+        this._streamDone = true;
         if (this.audioContext.state === 'suspended') await this.audioContext.resume();
-        const source = this.audioContext.createBufferSource();
-        source.buffer = buffer;
-        source.connect(this.gainNode);
-        source.onended = () => { this.currentSource = null; if (onEnded) onEnded(); };
-        source.start();
-        this.currentSource = source;
-        this._currentChunkStart = this.audioContext.currentTime;
-        this._allChunksEnqueued = true;
+        const src = this.audioContext.createBufferSource();
+        src.buffer = buffer;
+        src.connect(this.gainNode);
+        src.onended = () => { this.currentSource = null; if (onEnded) onEnded(); };
+        src.start();
+        this.currentSource = src;
+        this._chunkStart = this.audioContext.currentTime;
       }
       
       stop() { if (this.currentSource) { try { this.currentSource.stop(); } catch(e) {} this.currentSource = null; } }
-      fullStop() { this._cancelStream = true; this._resetQueue(); this.clearPregen(); }
+      fullStop() { this._resetQueue(); this.clearPregen(); }
       pause() { if (this.audioContext?.state === 'running') this.audioContext.suspend(); }
       resume() { if (this.audioContext?.state === 'suspended') this.audioContext.resume(); }
-      
-      get isPlaying() { return (this._isQueuePlaying || this.currentSource !== null) && this.audioContext?.state === 'running'; }
+      get isPlaying() { return (this._isPlaying || !!this.currentSource) && this.audioContext?.state === 'running'; }
       
       getProgress() {
-        const total = this._allChunksEnqueued ? this._totalDuration : this._estimatedDuration;
+        const total = this._streamDone ? this._totalDuration : this._estDuration;
         if (total <= 0) return 0;
-        let elapsed = 0;
-        if (this.currentSource && this._currentChunkStart) elapsed = this.audioContext.currentTime - this._currentChunkStart;
-        return Math.min(1, (this._playedDuration + elapsed) / total);
+        let el = 0;
+        if (this.currentSource && this._chunkStart) el = this.audioContext.currentTime - this._chunkStart;
+        return Math.min(1, (this._playedDuration + el) / total);
       }
       
       setVolume(v) { if (this.gainNode) this.gainNode.gain.value = Math.max(0, Math.min(1, v)); }
-      destroy() { this.fullStop(); if (this.audioContext) { this.audioContext.close().catch(() => {}); } this.tts = null; this.status = 'idle'; }
+      destroy() { this.fullStop(); if (this.worker) this.worker.terminate(); if (this.audioContext) this.audioContext.close().catch(() => {}); this.status = 'idle'; }
     }
     
     // Singleton instance
     const kokoroManager = new KokoroTTSManager();
+
 
 
     // ============================================================
