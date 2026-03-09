@@ -529,7 +529,7 @@
     // On mobile, WebGPU previously produced garbled audio with q8 quantization
     // (transformers.js bug #1320). Fix: use fp32 + transformers.js v4's new WebGPU runtime.
     
-    debugLog('Platform: ' + (IS_MOBILE ? 'MOBILE' : 'DESKTOP') + ', WebGPU: ' + HAS_WEBGPU + ', TTS: local kokoro-js (fp32/WebGPU if available)');
+    debugLog('Platform: ' + (IS_MOBILE ? 'MOBILE' : 'DESKTOP') + ', WebGPU: ' + HAS_WEBGPU);
     
     // ============================================================
     // CONSTANTS & SPECIAL MARKERS
@@ -1205,9 +1205,19 @@
         this._prePromises = {};
       }
       
-      async init(onProgress) {
-        if (this.status === 'ready') return;
+      async init(onProgress, opts = {}) {
+        const preferredDtype = opts.dtype || 'fp16';
+        
+        // Allow re-init if dtype changed
+        if (this.status === 'ready' && this._loadedDtype === preferredDtype) return;
         if (this.status === 'loading') return;
+        
+        // If re-initializing with different dtype, destroy old model first
+        if (this.tts && this._loadedDtype !== preferredDtype) {
+          debugLog('[TTS] Reinitializing: ' + this._loadedDtype + ' → ' + preferredDtype);
+          this.destroy();
+        }
+        
         this.status = 'loading';
         this.onProgressChange = onProgress;
         if (this.onStatusChange) this.onStatusChange('loading', 0);
@@ -1238,9 +1248,10 @@
             }
           } catch(e) {}
           
-          // dtype: fp32 for WebGPU (recommended by kokoro-js docs, avoids q8 garbling)
-          //        q8 for WASM (smaller download, WASM handles quantized formats fine)
-          const dtype = device === 'webgpu' ? 'fp32' : 'q8';
+          // dtype: user-selected for WebGPU (fp32, fp16, q8, q4, q4f16)
+          //        q8 for WASM (WASM handles quantized formats fine)
+          const dtype = device === 'webgpu' ? preferredDtype : 'q8';
+          this._loadedDtype = preferredDtype;
           
           debugLog('[TTS] Loading: ' + dtype + '/' + device + (IS_MOBILE ? ' (mobile)' : ' (desktop)'));
           
@@ -1929,6 +1940,7 @@
       const [isListenPlaying, setIsListenPlaying] = useState(false);
       const [listenSpeed, setListenSpeed] = useState(savedPrefs.current.listenSpeed || 1.0);
       const [selectedVoice, setSelectedVoice] = useState(savedPrefs.current.voice || 'af_heart');
+      const [modelQuality, setModelQuality] = useState(savedPrefs.current.modelQuality || 'fp16');
       const [dialogueVoice, setDialogueVoice] = useState(savedPrefs.current.dialogueVoice || 'af_bella');
       const [dialogueSplitEnabled, setDialogueSplitEnabled] = useState(savedPrefs.current.dialogueSplit || false);
       const [modelStatus, setModelStatus] = useState('idle');
@@ -2023,9 +2035,9 @@
           wpm, context: contextMode, voice: selectedVoice,
           dialogueVoice: dialogueVoice,
           dialogueSplit: dialogueSplitEnabled,
-          listenSpeed, onboarded: true,
+          listenSpeed, modelQuality, onboarded: true,
         });
-      }, [themeMode, pausesEnabled, hapticEnabled, wakeLockEnabled, smartPacingEnabled, paragraphPauseMs, wpm, contextMode, selectedVoice, dialogueVoice, dialogueSplitEnabled, listenSpeed]);
+      }, [themeMode, pausesEnabled, hapticEnabled, wakeLockEnabled, smartPacingEnabled, paragraphPauseMs, wpm, contextMode, selectedVoice, dialogueVoice, dialogueSplitEnabled, listenSpeed, modelQuality]);
 
       // ============================================================
       // PARSE CHAPTER TEXT INTO WORDS
@@ -2585,7 +2597,7 @@
           
           await ttsManager.init((progress) => {
             setModelLoadProgress(progress);
-          });
+          }, { dtype: modelQuality });
           
           debugLog('[INIT] ✓ TTS ready');
           setModelStatus('ready');
@@ -3136,7 +3148,7 @@
         if (modelStatus !== 'loading') return null;
         return e('div', { className: 'model-loading-overlay' }, [
           e('div', { key: 'spin', style: { width: '40px', height: '40px', border: '3px solid rgba(255,255,255,0.1)', borderTopColor: '#ef4444', borderRadius: '50%', animation: 'spin 1s linear infinite' } }),
-          e('div', { key: 'title', style: { fontSize: '1.125rem', fontWeight: '600', color: '#fff' } }, 'Loading Voice Model'),
+          e('div', { key: 'title', style: { fontSize: '1.125rem', fontWeight: '600', color: '#fff' } }, 'Loading Voice Model (' + modelQuality + ')'),
           e('div', { key: 'sub', style: { fontSize: '0.8125rem', color: 'rgba(255,255,255,0.5)' } },
             modelLoadProgress > 0 ? (Math.round(modelLoadProgress) + '%') : 'Initializing...'),
           e('div', { key: 'bar', className: 'model-progress-bar' },
@@ -3198,7 +3210,32 @@
                   style: { width: '8rem', height: '4px', borderRadius: '2px', backgroundColor: theme.cardBorder, cursor: 'pointer' },
                 }),
               ]),
-              modelStatus === 'ready' && e('div', { key: 'status', style: { fontSize: '0.6875rem', color: theme.muted, marginTop: '0.25rem' } }, '\u2713 Voice model loaded'),
+              e('div', { key: 'quality', className: 'settings-row' }, [
+                e('span', { key: 'ql', className: 'settings-row-label' }, 'Model Quality'),
+                e('select', {
+                  key: 'qsel',
+                  className: 'settings-select',
+                  value: modelQuality,
+                  onChange: (ev) => {
+                    setModelQuality(ev.target.value);
+                    // Force re-init on next play if model is loaded with different quality
+                    if (modelStatus === 'ready' && ttsManager._loadedDtype !== ev.target.value) {
+                      setModelStatus('idle');
+                      ttsManager.destroy();
+                    }
+                  },
+                }, [
+                  e('option', { key: 'fp32', value: 'fp32' }, 'fp32 — Best quality, slowest (~330MB)'),
+                  e('option', { key: 'fp16', value: 'fp16' }, 'fp16 — Great quality, faster (~165MB)'),
+                  e('option', { key: 'q8', value: 'q8' }, 'q8 — Good quality, fast (~86MB)'),
+                  e('option', { key: 'q4', value: 'q4' }, 'q4 — Lighter, fastest (~45MB)'),
+                  e('option', { key: 'q4f16', value: 'q4f16' }, 'q4f16 — Smallest, experimental'),
+                ]),
+              ]),
+              (modelStatus === 'ready' && ttsManager._loadedDtype !== modelQuality) && e('div', { key: 'reload-note', style: { fontSize: '0.6875rem', color: theme.accent, marginTop: '0.25rem' } },
+                'Tap Play to reload model with new quality'),
+              modelStatus === 'ready' && ttsManager._loadedDtype === modelQuality && e('div', { key: 'status', style: { fontSize: '0.6875rem', color: theme.muted, marginTop: '0.25rem' } },
+                '\u2713 Voice model loaded (' + (ttsManager._loadedDtype || '?') + ')'),
             ]),
             
             // Theme
